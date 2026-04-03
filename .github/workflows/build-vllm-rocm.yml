@@ -1,0 +1,614 @@
+name: Build vLLM + ROCm
+on:
+  workflow_dispatch:
+    inputs:
+      gfx_target:
+        description: 'AMD GPU targets (comma-separated)'
+        required: false
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X'
+      rocm_version:
+        description: 'ROCm version to use (e.g., 7.13.0a20260318) or "latest" to auto-detect'
+        required: false
+        default: 'latest'
+      vllm_version:
+        description: 'vLLM version (tag, branch, or commit hash) or "latest" for latest release'
+        required: false
+        default: 'latest'
+      pytorch_rocm_index:
+        description: 'PyTorch ROCm pip index URL'
+        required: false
+        default: 'https://download.pytorch.org/whl/rocm6.2'
+      create_release:
+        description: 'Create a GitHub release after successful build'
+        required: false
+        default: true
+        type: boolean
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  schedule:
+    # Weekly on Sunday at 3:00 PM UTC (two hours after ROCm nightly tarball)
+    - cron: '0 15 * * 0'
+
+env:
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X' }}
+  ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
+  VLLM_VERSION: ${{ github.event.inputs.vllm_version || 'latest' }}
+  PYTORCH_ROCM_INDEX: ${{ github.event.inputs.pytorch_rocm_index || 'https://download.pytorch.org/whl/rocm6.2' }}
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      ubuntu_matrix: ${{ steps.set-matrix.outputs.ubuntu_matrix }}
+    steps:
+    - name: Set matrix
+      id: set-matrix
+      run: |
+        targets="${{ env.GFX_TARGETS }}"
+        echo "Input targets: $targets"
+
+        # Convert targets to JSON array
+        matrix_targets=$(echo "$targets" \
+          | tr ',' '\n' \
+          | sed 's/^ *//;s/ *$//' \
+          | sed 's/^"//;s/"$//' \
+          | jq -R . \
+          | jq -s '{gfx_target: .}' \
+          | jq -c)
+
+        echo "ubuntu_matrix=$matrix_targets" >> $GITHUB_OUTPUT
+        echo "Generated matrix: $matrix_targets"
+
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    strategy:
+      matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
+      fail-fast: false
+    outputs:
+      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
+      vllm_commit_hash: ${{ steps.set-outputs.outputs.vllm_commit_hash }}
+
+    steps:
+    - name: Free disk space
+      run: |
+        echo "Freeing disk space for large build..."
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+        sudo rm -rf /usr/local/graalvm /usr/local/.ghcup /usr/local/share/powershell
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        sudo apt-get clean
+        df -h
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Clean up existing directories
+      run: |
+        [ -d "vllm" ] && rm -rf vllm
+        [ -d "/opt/rocm" ] && sudo rm -rf /opt/rocm
+        [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
+        echo "Cleanup completed"
+
+    - name: Install build dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y cmake ninja-build unzip curl patchelf \
+          python3.11 python3.11-venv python3.11-dev \
+          software-properties-common build-essential git-lfs
+        # Install Python 3.11 from deadsnakes if not available
+        if ! command -v python3.11 &> /dev/null; then
+          sudo add-apt-repository ppa:deadsnakes/ppa -y
+          sudo apt update
+          sudo apt install -y python3.11 python3.11-venv python3.11-dev
+        fi
+        python3.11 --version
+
+    - name: Download and extract ROCm directly to /opt/rocm
+      run: |
+        rocm_version="${{ env.ROCM_VERSION }}"
+        current_target="${{ matrix.gfx_target }}"
+
+        # Add appropriate suffixes for different GPU targets (same as llamacpp-rocm)
+        s3_target="$current_target"
+        if [ "$current_target" = "gfx103X" ]; then
+          s3_target="${current_target}-dgpu"
+        elif [[ "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
+          s3_target="${current_target}-all"
+        fi
+
+        if [ "$rocm_version" = "latest" ]; then
+          echo "Auto-detecting latest ROCm version for target: $current_target"
+          s3_response=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-${s3_target}-7")
+          files=$(echo "$s3_response" | grep -oP '(?<=<Key>)[^<]*' | grep "therock-dist-linux-${s3_target}-")
+
+          latest_file=""
+          latest_major=0
+          latest_minor=0
+          latest_patch=0
+          latest_rc=0
+          latest_is_alpha=false
+
+          while IFS= read -r file; do
+            if [[ "$file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+              version="${BASH_REMATCH[1]}"
+              major=$(echo "$version" | cut -d. -f1)
+              minor=$(echo "$version" | cut -d. -f2)
+              patch=$(echo "$version" | cut -d. -f3 | sed 's/\(a\|rc\).*//')
+              rc=$(echo "$version" | sed 's/.*\(a\|rc\)//')
+              is_alpha=false
+              [[ "$version" =~ a ]] && is_alpha=true
+
+              is_newer=false
+              if [ "$major" -gt "$latest_major" ]; then
+                is_newer=true
+              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -gt "$latest_minor" ]; then
+                is_newer=true
+              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -gt "$latest_patch" ]; then
+                is_newer=true
+              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -eq "$latest_patch" ]; then
+                if [ "$is_alpha" = true ] && [ "$latest_is_alpha" = false ]; then
+                  is_newer=true
+                elif [ "$is_alpha" = "$latest_is_alpha" ] && [ "$rc" -gt "$latest_rc" ]; then
+                  is_newer=true
+                fi
+              fi
+
+              if [ "$is_newer" = true ]; then
+                latest_file="$file"
+                latest_major="$major"
+                latest_minor="$minor"
+                latest_patch="$patch"
+                latest_rc="$rc"
+                latest_is_alpha="$is_alpha"
+              fi
+            fi
+          done <<< "$files"
+
+          echo "Found latest file: $latest_file"
+
+          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+            rocm_version="${BASH_REMATCH[1]}"
+            echo "Detected latest ROCm version: $rocm_version"
+          else
+            echo "Failed to extract ROCm version from: $latest_file"
+            exit 1
+          fi
+
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
+        else
+          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+        fi
+
+        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
+        echo "Streaming ROCm from: $rocm_url"
+
+        sudo mkdir -p /opt/rocm
+        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+
+    - name: Set ROCm environment variables
+      run: |
+        echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+        echo "ROCM_HOME=/opt/rocm" >> $GITHUB_ENV
+        echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
+        echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> $GITHUB_ENV
+        echo "HIP_INCLUDE_PATH=/opt/rocm/include" >> $GITHUB_ENV
+        echo "HIP_LIB_PATH=/opt/rocm/lib" >> $GITHUB_ENV
+        echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
+        echo "/opt/rocm/bin:/opt/rocm/llvm/bin" >> $GITHUB_PATH
+        echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+        echo "LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+        echo "CPATH=/opt/rocm/include:${CPATH:-}" >> $GITHUB_ENV
+        echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+
+    - name: Create Python virtual environment
+      run: |
+        echo "Creating portable Python venv..."
+        python3.11 -m venv --copies /opt/vllm
+        /opt/vllm/bin/python3 -m pip install --upgrade pip setuptools wheel
+        echo "Python version: $(/opt/vllm/bin/python3 --version)"
+
+    - name: Install PyTorch ROCm
+      run: |
+        echo "Installing PyTorch ROCm from: ${{ env.PYTORCH_ROCM_INDEX }}"
+        /opt/vllm/bin/pip install torch torchvision \
+          --index-url "${{ env.PYTORCH_ROCM_INDEX }}"
+        /opt/vllm/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__}, ROCm available: {torch.cuda.is_available()}')"
+
+    - name: Clone vLLM
+      run: |
+        vllm_version="${{ env.VLLM_VERSION }}"
+        if [ "$vllm_version" = "latest" ]; then
+          echo "Detecting latest vLLM release..."
+          vllm_version=$(curl -s https://api.github.com/repos/vllm-project/vllm/releases/latest | jq -r '.tag_name')
+          echo "Latest vLLM release: $vllm_version"
+        fi
+
+        echo "Cloning vLLM version: $vllm_version"
+        git clone --depth 1 --branch "$vllm_version" https://github.com/vllm-project/vllm.git
+
+        cd vllm
+        commit_hash=$(git rev-parse --short=7 HEAD)
+        echo "VLLM_COMMIT_HASH=$commit_hash" >> $GITHUB_ENV
+        echo "VLLM_TAG=$vllm_version" >> $GITHUB_ENV
+        echo "vLLM commit: $commit_hash (tag: $vllm_version)"
+        git log --oneline -1
+
+    - name: Build and install vLLM with ROCm
+      run: |
+        current_target="${{ matrix.gfx_target }}"
+        echo "Building vLLM for target: $current_target"
+
+        # Map GPU targets to specific architectures
+        if [ "$current_target" = "gfx110X" ]; then
+          mapped_target="gfx1100;gfx1101;gfx1102;gfx1103"
+        elif [ "$current_target" = "gfx103X" ]; then
+          mapped_target="gfx1030;gfx1031;gfx1032;gfx1034"
+        elif [ "$current_target" = "gfx1151" ]; then
+          mapped_target="gfx1151"
+        elif [ "$current_target" = "gfx1150" ]; then
+          mapped_target="gfx1150"
+        elif [ "$current_target" = "gfx120X" ]; then
+          mapped_target="gfx1200;gfx1201"
+        else
+          mapped_target="$current_target"
+        fi
+        echo "Mapped ROCM arch: $mapped_target"
+
+        cd vllm
+
+        # Set ROCm build environment
+        export PYTORCH_ROCM_ARCH="$mapped_target"
+        export VLLM_TARGET_DEVICE="rocm"
+        export CMAKE_BUILD_TYPE="Release"
+        export MAX_JOBS=$(nproc)
+
+        # Install vLLM build dependencies first
+        /opt/vllm/bin/pip install -r requirements/build.txt 2>/dev/null || true
+
+        # Install ROCm-specific requirements if present
+        if [ -f "requirements/rocm.txt" ]; then
+          /opt/vllm/bin/pip install -r requirements/rocm.txt
+        fi
+
+        # Build and install vLLM
+        echo "Building vLLM (this may take 30-60 minutes)..."
+        /opt/vllm/bin/pip install . --no-build-isolation -v 2>&1 | tail -100
+
+        # Verify installation
+        /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} installed successfully')"
+
+    - name: Copy ROCm runtime libs into venv
+      run: |
+        venv_lib="/opt/vllm/lib"
+        echo "Copying ROCm runtime libraries to venv..."
+
+        # Core HIP/ROCm runtime
+        cp -v /opt/rocm/lib/libamdhip64.so* "$venv_lib/" 2>/dev/null || echo "libamdhip64 not found"
+        cp -v /opt/rocm/lib/libhipblas.so* "$venv_lib/" 2>/dev/null || echo "libhipblas not found"
+        cp -v /opt/rocm/lib/librocblas.so* "$venv_lib/" 2>/dev/null || echo "librocblas not found"
+        cp -v /opt/rocm/lib/librocsolver.so* "$venv_lib/" 2>/dev/null || echo "librocsolver not found"
+        cp -v /opt/rocm/lib/libroctx64.so* "$venv_lib/" 2>/dev/null || echo "libroctx64 not found"
+        cp -v /opt/rocm/lib/libhipblaslt.so* "$venv_lib/" 2>/dev/null || echo "libhipblaslt not found"
+        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$venv_lib/" 2>/dev/null || echo "libhsa-runtime64 not found"
+        cp -v /opt/rocm/lib/libamd_comgr.so* "$venv_lib/" 2>/dev/null || echo "libamd_comgr not found"
+        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$venv_lib/" 2>/dev/null || echo "libamd_comgr_loader not found"
+        cp -v /opt/rocm/lib/librocprofiler-register.so* "$venv_lib/" 2>/dev/null || echo "librocprofiler-register not found"
+        cp -v /opt/rocm/lib/librocm_kpack.so* "$venv_lib/" 2>/dev/null || echo "librocm_kpack not found"
+        cp -v /opt/rocm/lib/librocroller.so* "$venv_lib/" 2>/dev/null || echo "librocroller not found"
+        cp -v /opt/rocm/lib/libhiprtc.so* "$venv_lib/" 2>/dev/null || echo "libhiprtc not found"
+        cp -v /opt/rocm/lib/libhipfft.so* "$venv_lib/" 2>/dev/null || echo "libhipfft not found"
+        cp -v /opt/rocm/lib/libhipsparse.so* "$venv_lib/" 2>/dev/null || echo "libhipsparse not found"
+        cp -v /opt/rocm/lib/libhipsolver.so* "$venv_lib/" 2>/dev/null || echo "libhipsolver not found"
+        cp -v /opt/rocm/lib/librocsparse.so* "$venv_lib/" 2>/dev/null || echo "librocsparse not found"
+        cp -v /opt/rocm/lib/librocfft.so* "$venv_lib/" 2>/dev/null || echo "librocfft not found"
+        cp -v /opt/rocm/lib/libMIOpen.so* "$venv_lib/" 2>/dev/null || echo "libMIOpen not found"
+        cp -v /opt/rocm/lib/librccl.so* "$venv_lib/" 2>/dev/null || echo "librccl not found"
+
+        # ROCm system deps
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$venv_lib/" 2>/dev/null || true
+
+        # LLVM/Clang (needed by comgr for runtime kernel compilation)
+        cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$venv_lib/" 2>/dev/null || true
+        cp -v /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$venv_lib/" 2>/dev/null || true
+
+        # rocBLAS kernel library
+        rocblas_lib="/opt/rocm/lib/rocblas/library"
+        if [ -d "$rocblas_lib" ]; then
+          mkdir -p "$venv_lib/rocblas"
+          cp -r "$rocblas_lib" "$venv_lib/rocblas/"
+          echo "Copied rocblas/library"
+        fi
+
+        # hipBLASLt kernel library
+        hipblaslt_lib="/opt/rocm/lib/hipblaslt/library"
+        if [ -d "$hipblaslt_lib" ]; then
+          mkdir -p "$venv_lib/hipblaslt"
+          cp -r "$hipblaslt_lib" "$venv_lib/hipblaslt/"
+          echo "Copied hipblaslt/library"
+        fi
+
+        # Copy libpython for portability
+        cp -v /usr/lib/x86_64-linux-gnu/libpython3.11*.so* "$venv_lib/" 2>/dev/null || true
+        # Also check the Python install location
+        cp -v /usr/lib/python3.11/config-3.11-x86_64-linux-gnu/libpython3.11*.so* "$venv_lib/" 2>/dev/null || true
+
+        echo "Finished copying ROCm and Python libraries"
+
+    - name: Create launcher script
+      run: |
+        cat > /opt/vllm/bin/vllm-server << 'LAUNCHER_EOF'
+        #!/bin/bash
+        # vllm-server launcher — sets up the bundled Python + ROCm environment
+        # and delegates to vLLM's OpenAI-compatible API server.
+        #
+        # Usage: vllm-server --model <model> --port <port> --host <host> [vllm args...]
+
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        VENV_DIR="$(dirname "$SCRIPT_DIR")"
+
+        # Set library paths for bundled ROCm and Python libs
+        export LD_LIBRARY_PATH="$VENV_DIR/lib:${LD_LIBRARY_PATH:-}"
+
+        # Point ROCm to bundled kernel libraries
+        if [ -d "$VENV_DIR/lib/rocblas/library" ]; then
+          export ROCBLAS_TENSILE_LIBPATH="$VENV_DIR/lib/rocblas/library"
+        fi
+
+        # Use the bundled Python
+        exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
+        LAUNCHER_EOF
+
+        chmod +x /opt/vllm/bin/vllm-server
+        echo "Created vllm-server launcher"
+
+    - name: Set RPATH for portable distribution
+      run: |
+        echo "Patching RPATHs for portability..."
+        cd /opt/vllm
+
+        # Patch the Python binary
+        patchelf --set-rpath '$ORIGIN/../lib' bin/python3.11 2>/dev/null || true
+
+        # Patch all .so files in lib/
+        find lib/ -maxdepth 1 -name '*.so*' -type f ! -type l | while read -r file; do
+          patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
+        done
+
+        # Patch .so files in site-packages (PyTorch, vLLM extensions)
+        find lib/python3.11/site-packages/ -name '*.so' -type f | while read -r file; do
+          patchelf --set-rpath '$ORIGIN:'"$PWD/lib" "$file" 2>/dev/null || true
+        done
+
+        echo "RPATH patching complete"
+
+    - name: Strip unnecessary files to reduce size
+      run: |
+        cd /opt/vllm
+        echo "Size before cleanup:"
+        du -sh .
+
+        # Remove __pycache__ directories
+        find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+        # Remove .pyc files
+        find . -name "*.pyc" -delete 2>/dev/null || true
+
+        # Remove pip/setuptools caches
+        rm -rf lib/python3.11/site-packages/pip* 2>/dev/null || true
+        rm -rf lib/python3.11/site-packages/setuptools* 2>/dev/null || true
+        rm -rf lib/python3.11/site-packages/wheel* 2>/dev/null || true
+
+        # Remove test directories from packages
+        find lib/python3.11/site-packages/ -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+        find lib/python3.11/site-packages/ -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+
+        echo "Size after cleanup:"
+        du -sh .
+
+    - name: List artifact contents
+      run: |
+        echo "=== Artifact structure ==="
+        echo "Top-level:"
+        ls -la /opt/vllm/
+        echo ""
+        echo "bin/ contents:"
+        ls -la /opt/vllm/bin/vllm-server /opt/vllm/bin/python3* 2>/dev/null
+        echo ""
+        echo "Key .so files in lib/:"
+        ls -la /opt/vllm/lib/lib*.so* 2>/dev/null | head -30
+        echo ""
+        echo "Total size:"
+        du -sh /opt/vllm/
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+        path: /opt/vllm/
+        retention-days: 30
+        compression-level: 6
+
+    - name: Set job outputs
+      id: set-outputs
+      run: |
+        rocm_version="${DETECTED_ROCM_VERSION:-${{ env.ROCM_VERSION }}}"
+        echo "rocm_version=$rocm_version" >> $GITHUB_OUTPUT
+        echo "vllm_commit_hash=${VLLM_COMMIT_HASH}" >> $GITHUB_OUTPUT
+        echo "vllm_tag=${VLLM_TAG}" >> $GITHUB_OUTPUT
+
+    - name: Clean up
+      if: always()
+      run: |
+        [ -d "/opt/rocm" ] && sudo rm -rf /opt/rocm
+        [ -d "vllm" ] && rm -rf vllm
+        [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
+        echo "Cleanup completed"
+
+  test-stx-halo:
+    runs-on: ${{ matrix.runner }}
+    needs: [prepare-matrix, build-ubuntu]
+    if: |
+      needs.build-ubuntu.result == 'success' &&
+      contains(github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X', 'gfx1151')
+    strategy:
+      matrix:
+        include:
+          - os: Linux
+            gfx_target: gfx1151
+            runner: ["stx-halo", "Linux"]
+      fail-fast: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Test vLLM build
+      uses: ./.github/actions/test-vllm-build
+      with:
+        os_type: Linux
+        gfx_target: ${{ matrix.gfx_target }}
+        artifact_name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+
+  test-stx:
+    runs-on: ${{ matrix.runner }}
+    needs: [prepare-matrix, build-ubuntu]
+    if: |
+      needs.build-ubuntu.result == 'success' &&
+      contains(github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X', 'gfx1150')
+    strategy:
+      matrix:
+        include:
+          - os: Linux
+            gfx_target: gfx1150
+            runner: ["stx", "Linux"]
+      fail-fast: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Test vLLM build
+      uses: ./.github/actions/test-vllm-build
+      with:
+        os_type: Linux
+        gfx_target: ${{ matrix.gfx_target }}
+        artifact_name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+
+  create-release:
+    needs: [prepare-matrix, build-ubuntu, test-stx-halo, test-stx]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    if: |
+      always() &&
+      needs.build-ubuntu.result == 'success' &&
+      (needs.test-stx-halo.result == 'success' || needs.test-stx-halo.result == 'skipped') &&
+      (needs.test-stx.result == 'success' || needs.test-stx.result == 'skipped') &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
+       github.event_name == 'schedule')
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./all-artifacts
+
+    - name: Generate release tag
+      id: generate-tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || echo "")
+
+        if [ -z "$existing_tags" ]; then
+          next_number=1000
+        else
+          highest_tag=$(echo "$existing_tags" | tail -n 1)
+          highest_number=$(echo "$highest_tag" | sed 's/^b//')
+          next_number=$((highest_number + 1))
+        fi
+
+        TAG=$(printf "b%04d" $next_number)
+        echo "tag=${TAG}" >> $GITHUB_OUTPUT
+        echo "Generated release tag: ${TAG}"
+
+    - name: Check if tag already exists
+      id: check-tag
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+          echo "tag_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "tag_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create archives for all target artifacts
+      if: steps.check-tag.outputs.tag_exists == 'false'
+      run: |
+        targets="${{ env.GFX_TARGETS }}"
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+
+        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
+        for target in "${TARGET_ARRAY[@]}"; do
+          target=$(echo "$target" | xargs)
+          artifact_name="vllm-ubuntu-rocm-${target}-x64"
+          artifact_dir="./all-artifacts/${artifact_name}"
+          final_archive="vllm-${TAG}-ubuntu-rocm-${target}-x64"
+
+          if [ -d "$artifact_dir" ]; then
+            echo "Creating archive: ${final_archive}.tar.gz"
+            tar -czf "${final_archive}.tar.gz" -C "$artifact_dir" .
+            echo "Archive size: $(du -sh ${final_archive}.tar.gz | cut -f1)"
+          else
+            echo "Warning: Artifact directory not found: $artifact_dir"
+            ls -la ./all-artifacts/
+          fi
+        done
+
+        echo "Created archives:"
+        ls -la *.tar.gz
+
+    - name: Create Release
+      if: steps.check-tag.outputs.tag_exists == 'false'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        TAG="${{ steps.generate-tag.outputs.tag }}"
+        ROCM_VERSION="${{ needs.build-ubuntu.outputs.rocm_version }}"
+        VLLM_COMMIT_HASH="${{ needs.build-ubuntu.outputs.vllm_commit_hash }}"
+        targets="${{ env.GFX_TARGETS }}"
+
+        upload_files=""
+        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
+        for target in "${TARGET_ARRAY[@]}"; do
+          target=$(echo "$target" | xargs)
+          archive="vllm-${TAG}-ubuntu-rocm-${target}-x64.tar.gz"
+          [ -f "$archive" ] && upload_files="$upload_files $archive"
+        done
+
+        gh release create "$TAG" \
+          --title "$TAG" \
+          --notes "**Build Number**: $TAG
+        **GPU Target(s)**: $targets
+        **ROCm Version**: $ROCM_VERSION
+        **vLLM Commit**: $VLLM_COMMIT_HASH
+        **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+        Portable vLLM builds with bundled ROCm runtime and Python environment. Extract and run \`bin/vllm-server\` — no separate ROCm or Python installation required." \
+          $upload_files

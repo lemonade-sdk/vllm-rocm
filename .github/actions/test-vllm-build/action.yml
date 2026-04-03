@@ -1,0 +1,169 @@
+name: 'Test vLLM Build'
+description: 'Download and test vLLM build artifacts on AMD ROCm hardware'
+
+inputs:
+  os_type:
+    description: 'Operating system type (Linux)'
+    required: true
+  gfx_target:
+    description: 'GPU target (e.g., gfx1151, gfx1150)'
+    required: true
+  artifact_name:
+    description: 'Full artifact name to download'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: vllm-install
+
+    - name: Make binaries executable
+      shell: bash
+      run: |
+        chmod +x vllm-install/bin/vllm-server
+        chmod +x vllm-install/bin/python3* 2>/dev/null || true
+
+    - name: Verify vLLM installation
+      shell: bash
+      run: |
+        echo "Checking vLLM installation..."
+        export LD_LIBRARY_PATH="$(pwd)/vllm-install/lib:$LD_LIBRARY_PATH"
+
+        # Check Python works
+        ./vllm-install/bin/python3 --version
+
+        # Check vLLM is importable
+        ./vllm-install/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__}')"
+
+        # Check torch ROCm
+        ./vllm-install/bin/python3 -c "
+        import torch
+        print(f'PyTorch {torch.__version__}')
+        print(f'ROCm available: {torch.cuda.is_available()}')
+        if torch.cuda.is_available():
+            print(f'GPU: {torch.cuda.get_device_name(0)}')
+            print(f'GPU count: {torch.cuda.device_count()}')
+        "
+
+    - name: Run vLLM server smoke test
+      shell: bash
+      run: |
+        export LD_LIBRARY_PATH="$(pwd)/vllm-install/lib:$LD_LIBRARY_PATH"
+
+        model="facebook/opt-125m"
+        port=8192
+        server_log="vllm_server.log"
+
+        echo "Starting vLLM server with model: $model on port: $port"
+
+        # Start server in background
+        ./vllm-install/bin/vllm-server \
+          --model "$model" \
+          --port $port \
+          --host 127.0.0.1 \
+          --dtype float16 \
+          --max-model-len 512 \
+          --gpu-memory-utilization 0.5 \
+          > "$server_log" 2>&1 &
+        SERVER_PID=$!
+        echo "Server PID: $SERVER_PID"
+
+        # Wait for server to be ready (up to 10 minutes)
+        echo "Waiting for server to be ready..."
+        ready=false
+        for i in $(seq 1 120); do
+          if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "Server process died unexpectedly"
+            echo "=== Server Log ==="
+            cat "$server_log"
+            exit 1
+          fi
+
+          if curl -s "http://127.0.0.1:$port/health" 2>/dev/null | grep -q "ok\|healthy\|200"; then
+            echo "Server is ready after ~$((i*5)) seconds"
+            ready=true
+            break
+          fi
+
+          # Also check if the models endpoint works (alternative readiness check)
+          if curl -sf "http://127.0.0.1:$port/v1/models" > /dev/null 2>&1; then
+            echo "Server is ready (models endpoint) after ~$((i*5)) seconds"
+            ready=true
+            break
+          fi
+
+          sleep 5
+        done
+
+        if [ "$ready" = false ]; then
+          echo "Server failed to become ready within timeout"
+          echo "=== Server Log (last 100 lines) ==="
+          tail -100 "$server_log"
+          kill $SERVER_PID 2>/dev/null
+          exit 1
+        fi
+
+        # Send a completion request
+        echo "Sending test completion request..."
+        response=$(curl -sf "http://127.0.0.1:$port/v1/completions" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"model\": \"$model\",
+            \"prompt\": \"The meaning of life is\",
+            \"max_tokens\": 20,
+            \"temperature\": 0.0
+          }" 2>&1)
+        curl_exit=$?
+
+        echo "=== Completion Response ==="
+        echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+
+        # Validate response
+        if [ $curl_exit -ne 0 ]; then
+          echo "FAILED: curl request failed with exit code $curl_exit"
+          echo "=== Server Log (last 50 lines) ==="
+          tail -50 "$server_log"
+          kill $SERVER_PID 2>/dev/null
+          exit 1
+        fi
+
+        # Check response has generated text
+        has_text=$(echo "$response" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            text = data['choices'][0]['text']
+            print(f'Generated text: {text}')
+            sys.exit(0 if len(text.strip()) > 0 else 1)
+        except Exception as e:
+            print(f'Error: {e}')
+            sys.exit(1)
+        " 2>&1)
+        text_exit=$?
+        echo "$has_text"
+
+        # Cleanup
+        kill $SERVER_PID 2>/dev/null
+        wait $SERVER_PID 2>/dev/null || true
+
+        echo "=== TEST RESULTS ==="
+        if [ $text_exit -eq 0 ]; then
+          echo "Test PASSED - Server started, loaded model, and generated text"
+        else
+          echo "Test FAILED - Response did not contain generated text"
+          echo "=== Server Log (last 50 lines) ==="
+          tail -50 "$server_log"
+          exit 1
+        fi
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        # Kill any remaining server processes
+        pkill -f "vllm.entrypoints" 2>/dev/null || true
+        rm -f vllm_server.log
