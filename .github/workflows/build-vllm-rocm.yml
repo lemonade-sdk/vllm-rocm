@@ -162,13 +162,8 @@ jobs:
         rm -rf lib/python3.12/turtledemo lib/python3.12/ensurepip 2>/dev/null || true
         rm -rf include/ 2>/dev/null || true
 
-        # Strip debug symbols (skip ROCm SDK libs — strip breaks their page alignment)
-        echo "Stripping debug symbols..."
-        find . -name '*.so' -o -name '*.so.*' | \
-          grep -v '_rocm_sdk' | \
-          while read -r f; do
-            [ -f "$f" ] && [ ! -L "$f" ] && strip --strip-debug "$f" 2>/dev/null || true
-          done
+        # NOTE: Do NOT strip .so files — AMD ROCm wheels use special ELF
+        # alignment that strip corrupts, and numpy/scipy also break.
 
         echo "=== Size after cleanup ==="
         du -sh .
