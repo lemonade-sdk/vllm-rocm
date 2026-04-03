@@ -5,19 +5,7 @@ on:
       gfx_target:
         description: 'AMD GPU targets (comma-separated)'
         required: false
-        default: 'gfx1151,gfx1150,gfx120X,gfx110X'
-      rocm_version:
-        description: 'ROCm version to use (e.g., 7.13.0a20260318) or "latest" to auto-detect'
-        required: false
-        default: 'latest'
-      vllm_version:
-        description: 'vLLM version (tag, branch, or commit hash) or "latest" for latest release'
-        required: false
-        default: 'latest'
-      pytorch_rocm_index:
-        description: 'PyTorch ROCm pip index URL'
-        required: false
-        default: 'https://download.pytorch.org/whl/rocm6.2'
+        default: 'gfx1151,gfx1150,gfx120X'
       create_release:
         description: 'Create a GitHub release after successful build'
         required: false
@@ -28,14 +16,10 @@ on:
     types: [opened, synchronize, reopened]
 
   schedule:
-    # Weekly on Sunday at 3:00 PM UTC (two hours after ROCm nightly tarball)
     - cron: '0 15 * * 0'
 
 env:
-  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X' }}
-  ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
-  VLLM_VERSION: ${{ github.event.inputs.vllm_version || 'latest' }}
-  PYTORCH_ROCM_INDEX: ${{ github.event.inputs.pytorch_rocm_index || 'https://download.pytorch.org/whl/rocm6.2' }}
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X' }}
 
 jobs:
   prepare-matrix:
@@ -47,17 +31,12 @@ jobs:
       id: set-matrix
       run: |
         targets="${{ env.GFX_TARGETS }}"
-        echo "Input targets: $targets"
-
-        # Convert targets to JSON array
         matrix_targets=$(echo "$targets" \
           | tr ',' '\n' \
           | sed 's/^ *//;s/ *$//' \
-          | sed 's/^"//;s/"$//' \
           | jq -R . \
           | jq -s '{gfx_target: .}' \
           | jq -c)
-
         echo "ubuntu_matrix=$matrix_targets" >> $GITHUB_OUTPUT
         echo "Generated matrix: $matrix_targets"
 
@@ -68,279 +47,67 @@ jobs:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
     outputs:
-      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
-      vllm_commit_hash: ${{ steps.set-outputs.outputs.vllm_commit_hash }}
+      vllm_version: ${{ steps.set-outputs.outputs.vllm_version }}
+      torch_version: ${{ steps.set-outputs.outputs.torch_version }}
 
     steps:
-    - name: Free disk space
-      run: |
-        echo "Freeing disk space for large build..."
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-        sudo rm -rf /usr/local/graalvm /usr/local/.ghcup /usr/local/share/powershell
-        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-        sudo apt-get clean
-        df -h
-
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Clean up existing directories
+    - name: Install Python 3.12
       run: |
-        [ -d "vllm" ] && rm -rf vllm
-        [ -d "/opt/rocm" ] && sudo rm -rf /opt/rocm
-        [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
-        echo "Cleanup completed"
-
-    - name: Install build dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y software-properties-common build-essential \
-          cmake ninja-build unzip curl patchelf git-lfs
-
-        # Python 3.11 via deadsnakes PPA (not in ubuntu-22.04 default repos)
         sudo add-apt-repository ppa:deadsnakes/ppa -y
         sudo apt update
-        sudo apt install -y python3.11 python3.11-venv python3.11-dev
-        python3.11 --version
+        sudo apt install -y python3.12 python3.12-venv python3.12-dev
+        python3.12 --version
 
-    - name: Download and extract ROCm directly to /opt/rocm
+    - name: Map GPU target to AMD wheel URLs
+      id: wheel-urls
       run: |
-        rocm_version="${{ env.ROCM_VERSION }}"
-        current_target="${{ matrix.gfx_target }}"
+        target="${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets (same as llamacpp-rocm)
-        s3_target="$current_target"
-        if [ "$current_target" = "gfx103X" ]; then
-          s3_target="${current_target}-dgpu"
-        elif [[ "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
-          s3_target="${current_target}-all"
-        fi
-
-        if [ "$rocm_version" = "latest" ]; then
-          echo "Auto-detecting latest ROCm version for target: $current_target"
-          s3_response=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-${s3_target}-7")
-          files=$(echo "$s3_response" | grep -oP '(?<=<Key>)[^<]*' | grep "therock-dist-linux-${s3_target}-")
-
-          latest_file=""
-          latest_major=0
-          latest_minor=0
-          latest_patch=0
-          latest_rc=0
-          latest_is_alpha=false
-
-          while IFS= read -r file; do
-            if [[ "$file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
-              version="${BASH_REMATCH[1]}"
-              major=$(echo "$version" | cut -d. -f1)
-              minor=$(echo "$version" | cut -d. -f2)
-              patch=$(echo "$version" | cut -d. -f3 | sed 's/\(a\|rc\).*//')
-              rc=$(echo "$version" | sed 's/.*\(a\|rc\)//')
-              is_alpha=false
-              [[ "$version" =~ a ]] && is_alpha=true
-
-              is_newer=false
-              if [ "$major" -gt "$latest_major" ]; then
-                is_newer=true
-              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -gt "$latest_minor" ]; then
-                is_newer=true
-              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -gt "$latest_patch" ]; then
-                is_newer=true
-              elif [ "$major" -eq "$latest_major" ] && [ "$minor" -eq "$latest_minor" ] && [ "$patch" -eq "$latest_patch" ]; then
-                if [ "$is_alpha" = true ] && [ "$latest_is_alpha" = false ]; then
-                  is_newer=true
-                elif [ "$is_alpha" = "$latest_is_alpha" ] && [ "$rc" -gt "$latest_rc" ]; then
-                  is_newer=true
-                fi
-              fi
-
-              if [ "$is_newer" = true ]; then
-                latest_file="$file"
-                latest_major="$major"
-                latest_minor="$minor"
-                latest_patch="$patch"
-                latest_rc="$rc"
-                latest_is_alpha="$is_alpha"
-              fi
-            fi
-          done <<< "$files"
-
-          echo "Found latest file: $latest_file"
-
-          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
-            rocm_version="${BASH_REMATCH[1]}"
-            echo "Detected latest ROCm version: $rocm_version"
-          else
-            echo "Failed to extract ROCm version from: $latest_file"
+        # Map targets to AMD wheel URL suffixes
+        # See: https://rocm.docs.amd.com/en/latest/rocm-for-ai/vllm.html
+        case "$target" in
+          gfx1151) suffix="gfx1151" ;;
+          gfx1150) suffix="gfx1150" ;;
+          gfx120X) suffix="gfx120X-all" ;;
+          *)
+            echo "ERROR: No AMD pre-built wheels for target: $target"
             exit 1
-          fi
+            ;;
+        esac
 
-          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
-        else
-          rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
-        fi
-
-        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
-        echo "Streaming ROCm from: $rocm_url"
-
-        sudo mkdir -p /opt/rocm
-        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
-
-    - name: Set ROCm environment variables
-      run: |
-        echo "HIP_PATH=/opt/rocm" >> $GITHUB_ENV
-        echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
-        echo "ROCM_HOME=/opt/rocm" >> $GITHUB_ENV
-        echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
-        echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> $GITHUB_ENV
-        echo "HIP_INCLUDE_PATH=/opt/rocm/include" >> $GITHUB_ENV
-        echo "HIP_LIB_PATH=/opt/rocm/lib" >> $GITHUB_ENV
-        echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode" >> $GITHUB_ENV
-        echo "/opt/rocm/bin:/opt/rocm/llvm/bin" >> $GITHUB_PATH
-        echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
-        echo "LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:${LIBRARY_PATH:-}" >> $GITHUB_ENV
-        echo "CPATH=/opt/rocm/include:${CPATH:-}" >> $GITHUB_ENV
-        echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+        echo "torch_index=https://repo.amd.com/rocm/whl/${suffix}/" >> $GITHUB_OUTPUT
+        echo "vllm_index=https://rocm.frameworks.amd.com/whl/${suffix}/" >> $GITHUB_OUTPUT
+        echo "Using PyTorch index: https://repo.amd.com/rocm/whl/${suffix}/"
+        echo "Using vLLM index: https://rocm.frameworks.amd.com/whl/${suffix}/"
 
     - name: Create Python virtual environment
       run: |
-        echo "Creating portable Python venv..."
-        python3.11 -m venv --copies /opt/vllm
-        /opt/vllm/bin/python3 -m pip install --upgrade pip setuptools wheel
-        echo "Python version: $(/opt/vllm/bin/python3 --version)"
+        python3.12 -m venv --copies /opt/vllm
+        /opt/vllm/bin/python3 -m pip install --upgrade pip
+        echo "Python: $(/opt/vllm/bin/python3 --version)"
 
-    - name: Install PyTorch ROCm
+    - name: Install PyTorch ROCm from AMD
       run: |
-        echo "Installing PyTorch ROCm from: ${{ env.PYTORCH_ROCM_INDEX }}"
-        /opt/vllm/bin/pip install torch torchvision \
-          --index-url "${{ env.PYTORCH_ROCM_INDEX }}"
-        /opt/vllm/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__}, ROCm available: {torch.cuda.is_available()}')"
+        echo "Installing PyTorch from AMD ROCm wheel index..."
+        /opt/vllm/bin/pip install \
+          --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
+          torch torchvision
+        /opt/vllm/bin/python3 -c "
+        import torch
+        print(f'PyTorch {torch.__version__}')
+        print(f'ROCm built-in: {torch.version.hip is not None}')
+        "
 
-    - name: Clone vLLM
+    - name: Install vLLM ROCm from AMD
       run: |
-        vllm_version="${{ env.VLLM_VERSION }}"
-        if [ "$vllm_version" = "latest" ]; then
-          echo "Detecting latest vLLM release..."
-          vllm_version=$(curl -s https://api.github.com/repos/vllm-project/vllm/releases/latest | jq -r '.tag_name')
-          echo "Latest vLLM release: $vllm_version"
-        fi
-
-        echo "Cloning vLLM version: $vllm_version"
-        git clone --depth 1 --branch "$vllm_version" https://github.com/vllm-project/vllm.git
-
-        cd vllm
-        commit_hash=$(git rev-parse --short=7 HEAD)
-        echo "VLLM_COMMIT_HASH=$commit_hash" >> $GITHUB_ENV
-        echo "VLLM_TAG=$vllm_version" >> $GITHUB_ENV
-        echo "vLLM commit: $commit_hash (tag: $vllm_version)"
-        git log --oneline -1
-
-    - name: Build and install vLLM with ROCm
-      run: |
-        current_target="${{ matrix.gfx_target }}"
-        echo "Building vLLM for target: $current_target"
-
-        # Map GPU targets to specific architectures
-        if [ "$current_target" = "gfx110X" ]; then
-          mapped_target="gfx1100;gfx1101;gfx1102;gfx1103"
-        elif [ "$current_target" = "gfx103X" ]; then
-          mapped_target="gfx1030;gfx1031;gfx1032;gfx1034"
-        elif [ "$current_target" = "gfx1151" ]; then
-          mapped_target="gfx1151"
-        elif [ "$current_target" = "gfx1150" ]; then
-          mapped_target="gfx1150"
-        elif [ "$current_target" = "gfx120X" ]; then
-          mapped_target="gfx1200;gfx1201"
-        else
-          mapped_target="$current_target"
-        fi
-        echo "Mapped ROCM arch: $mapped_target"
-
-        cd vllm
-
-        # Set ROCm build environment
-        export PYTORCH_ROCM_ARCH="$mapped_target"
-        export VLLM_TARGET_DEVICE="rocm"
-        export CMAKE_BUILD_TYPE="Release"
-        export MAX_JOBS=$(nproc)
-
-        # Install vLLM build dependencies first
-        /opt/vllm/bin/pip install -r requirements/build.txt 2>/dev/null || true
-
-        # Install ROCm-specific requirements if present
-        if [ -f "requirements/rocm.txt" ]; then
-          /opt/vllm/bin/pip install -r requirements/rocm.txt
-        fi
-
-        # Build and install vLLM
-        echo "Building vLLM (this may take 30-60 minutes)..."
-        /opt/vllm/bin/pip install . --no-build-isolation -v 2>&1 | tail -100
-
-        # Verify installation
-        /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} installed successfully')"
-
-    - name: Copy ROCm runtime libs into venv
-      run: |
-        venv_lib="/opt/vllm/lib"
-        echo "Copying ROCm runtime libraries to venv..."
-
-        # Core HIP/ROCm runtime
-        cp -v /opt/rocm/lib/libamdhip64.so* "$venv_lib/" 2>/dev/null || echo "libamdhip64 not found"
-        cp -v /opt/rocm/lib/libhipblas.so* "$venv_lib/" 2>/dev/null || echo "libhipblas not found"
-        cp -v /opt/rocm/lib/librocblas.so* "$venv_lib/" 2>/dev/null || echo "librocblas not found"
-        cp -v /opt/rocm/lib/librocsolver.so* "$venv_lib/" 2>/dev/null || echo "librocsolver not found"
-        cp -v /opt/rocm/lib/libroctx64.so* "$venv_lib/" 2>/dev/null || echo "libroctx64 not found"
-        cp -v /opt/rocm/lib/libhipblaslt.so* "$venv_lib/" 2>/dev/null || echo "libhipblaslt not found"
-        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$venv_lib/" 2>/dev/null || echo "libhsa-runtime64 not found"
-        cp -v /opt/rocm/lib/libamd_comgr.so* "$venv_lib/" 2>/dev/null || echo "libamd_comgr not found"
-        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$venv_lib/" 2>/dev/null || echo "libamd_comgr_loader not found"
-        cp -v /opt/rocm/lib/librocprofiler-register.so* "$venv_lib/" 2>/dev/null || echo "librocprofiler-register not found"
-        cp -v /opt/rocm/lib/librocm_kpack.so* "$venv_lib/" 2>/dev/null || echo "librocm_kpack not found"
-        cp -v /opt/rocm/lib/librocroller.so* "$venv_lib/" 2>/dev/null || echo "librocroller not found"
-        cp -v /opt/rocm/lib/libhiprtc.so* "$venv_lib/" 2>/dev/null || echo "libhiprtc not found"
-        cp -v /opt/rocm/lib/libhipfft.so* "$venv_lib/" 2>/dev/null || echo "libhipfft not found"
-        cp -v /opt/rocm/lib/libhipsparse.so* "$venv_lib/" 2>/dev/null || echo "libhipsparse not found"
-        cp -v /opt/rocm/lib/libhipsolver.so* "$venv_lib/" 2>/dev/null || echo "libhipsolver not found"
-        cp -v /opt/rocm/lib/librocsparse.so* "$venv_lib/" 2>/dev/null || echo "librocsparse not found"
-        cp -v /opt/rocm/lib/librocfft.so* "$venv_lib/" 2>/dev/null || echo "librocfft not found"
-        cp -v /opt/rocm/lib/libMIOpen.so* "$venv_lib/" 2>/dev/null || echo "libMIOpen not found"
-        cp -v /opt/rocm/lib/librccl.so* "$venv_lib/" 2>/dev/null || echo "librccl not found"
-
-        # ROCm system deps
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$venv_lib/" 2>/dev/null || true
-
-        # LLVM/Clang (needed by comgr for runtime kernel compilation)
-        cp -v /opt/rocm/lib/llvm/lib/libLLVM.so* "$venv_lib/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/llvm/lib/libclang-cpp.so* "$venv_lib/" 2>/dev/null || true
-
-        # rocBLAS kernel library
-        rocblas_lib="/opt/rocm/lib/rocblas/library"
-        if [ -d "$rocblas_lib" ]; then
-          mkdir -p "$venv_lib/rocblas"
-          cp -r "$rocblas_lib" "$venv_lib/rocblas/"
-          echo "Copied rocblas/library"
-        fi
-
-        # hipBLASLt kernel library
-        hipblaslt_lib="/opt/rocm/lib/hipblaslt/library"
-        if [ -d "$hipblaslt_lib" ]; then
-          mkdir -p "$venv_lib/hipblaslt"
-          cp -r "$hipblaslt_lib" "$venv_lib/hipblaslt/"
-          echo "Copied hipblaslt/library"
-        fi
-
-        # Copy libpython for portability
-        cp -v /usr/lib/x86_64-linux-gnu/libpython3.11*.so* "$venv_lib/" 2>/dev/null || true
-        # Also check the Python install location
-        cp -v /usr/lib/python3.11/config-3.11-x86_64-linux-gnu/libpython3.11*.so* "$venv_lib/" 2>/dev/null || true
-
-        echo "Finished copying ROCm and Python libraries"
+        echo "Installing vLLM from AMD ROCm wheel index..."
+        /opt/vllm/bin/pip install \
+          --extra-index-url "${{ steps.wheel-urls.outputs.vllm_index }}" \
+          vllm
+        /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__}')"
 
     - name: Create launcher script
       run: |
@@ -348,149 +115,84 @@ jobs:
         #!/bin/bash
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         VENV_DIR="$(dirname "$SCRIPT_DIR")"
-        export LD_LIBRARY_PATH="$VENV_DIR/lib:${LD_LIBRARY_PATH:-}"
-        if [ -d "$VENV_DIR/lib/rocblas/library" ]; then
-        export ROCBLAS_TENSILE_LIBPATH="$VENV_DIR/lib/rocblas/library"
+        SP="$VENV_DIR/lib/python3.12/site-packages"
+        ROCM_LIB="$SP/_rocm_sdk_core/lib"
+        if [ -d "$ROCM_LIB" ]; then
+        export LD_LIBRARY_PATH="$ROCM_LIB:${LD_LIBRARY_PATH:-}"
         fi
+        export PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
+        export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
         exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
-        # Remove leading whitespace from YAML indentation
+        # Remove YAML indentation from heredoc
         sed -i 's/^        //' /opt/vllm/bin/vllm-server
-
         chmod +x /opt/vllm/bin/vllm-server
-        echo "Created vllm-server launcher"
+        echo "Launcher script:"
         cat /opt/vllm/bin/vllm-server
-
-    - name: Set RPATH for portable distribution
-      run: |
-        echo "Patching RPATHs for portability..."
-        cd /opt/vllm
-
-        # Patch the Python binary
-        patchelf --set-rpath '$ORIGIN/../lib' bin/python3.11 2>/dev/null || true
-
-        # Patch all .so files in lib/
-        find lib/ -maxdepth 1 -name '*.so*' -type f ! -type l | while read -r file; do
-          patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
-        done
-
-        # Patch .so files in site-packages (PyTorch, vLLM extensions)
-        find lib/python3.11/site-packages/ -name '*.so' -type f | while read -r file; do
-          patchelf --set-rpath '$ORIGIN:'"$PWD/lib" "$file" 2>/dev/null || true
-        done
-
-        echo "RPATH patching complete"
 
     - name: Strip unnecessary files to reduce size
       run: |
         cd /opt/vllm
         echo "=== Size before cleanup ==="
         du -sh .
-        echo "Top consumers:"
-        du -sh lib/python3.11/site-packages/torch/ 2>/dev/null || true
-        du -sh lib/rocblas/ 2>/dev/null || true
-        du -sh lib/hipblaslt/ 2>/dev/null || true
-        du -sh lib/libLLVM* 2>/dev/null || true
-        du -sh lib/libclang* 2>/dev/null || true
 
-        # --- PyTorch cleanup (biggest win, ~2-3 GB savings) ---
-        SP="lib/python3.11/site-packages"
+        SP="lib/python3.12/site-packages"
 
-        # Remove PyTorch test/benchmark/docs data
-        rm -rf $SP/torch/test $SP/torch/testing $SP/torch/benchmarks 2>/dev/null || true
-        rm -rf $SP/torch/_inductor/autoheuristic/datasets 2>/dev/null || true
-        rm -rf $SP/torch/share 2>/dev/null || true
+        # Remove pip/setuptools/wheel
+        rm -rf $SP/pip* $SP/setuptools* $SP/wheel* $SP/pkg_resources* 2>/dev/null || true
+        rm -f $SP/distutils-precedence.pth 2>/dev/null || true
+        rm -rf $SP/_distutils_hack 2>/dev/null || true
 
-        # Remove unused PyTorch backends (we only need ROCm/HIP)
-        rm -rf $SP/torch/lib/libtorch_cuda.so 2>/dev/null || true
-        rm -rf $SP/torch/lib/libcudnn*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libnvrtc*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libcublas*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libcusparse*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libcusolver*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libcufft*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libnccl*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libnvfuser*.so* 2>/dev/null || true
-        rm -rf $SP/torch/lib/libcaffe2_nvrtc.so 2>/dev/null || true
-
-        # Remove triton backends we don't need
-        rm -rf $SP/triton/backends/nvidia 2>/dev/null || true
-
-        # Remove torchvision unnecessary data
-        rm -rf $SP/torchvision/datasets 2>/dev/null || true
-        rm -rf $SP/torchvision/models/_api.py 2>/dev/null || true
-
-        # --- General Python cleanup ---
+        # Remove __pycache__ and .pyc
         find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
         find . -name "*.pyc" -delete 2>/dev/null || true
-        find . -name "*.pyi" -delete 2>/dev/null || true
 
-        # Remove pip/setuptools/wheel (not needed at runtime)
-        rm -rf $SP/pip* $SP/setuptools* $SP/wheel* $SP/pkg_resources* 2>/dev/null || true
-        # Remove distutils-precedence.pth which references the deleted setuptools
-        rm -f $SP/distutils-precedence.pth 2>/dev/null || true
-
-        # Remove .dist-info metadata EXCEPT for vllm (it reads __version__ from it)
-        find $SP -maxdepth 1 -type d -name "*.dist-info" ! -name "vllm*" -exec rm -rf {} + 2>/dev/null || true
-
-        # Remove test/benchmark dirs from all packages
+        # Remove test/benchmark dirs
         find $SP -maxdepth 2 -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
         find $SP -maxdepth 2 -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
         find $SP -maxdepth 2 -type d -name "benchmarks" -exec rm -rf {} + 2>/dev/null || true
+        rm -rf $SP/torch/test $SP/torch/testing 2>/dev/null || true
 
-        # Remove Python stdlib modules we don't need
-        rm -rf lib/python3.11/test 2>/dev/null || true
-        rm -rf lib/python3.11/unittest 2>/dev/null || true
-        rm -rf lib/python3.11/tkinter 2>/dev/null || true
-        rm -rf lib/python3.11/idlelib 2>/dev/null || true
-        rm -rf lib/python3.11/turtledemo 2>/dev/null || true
-        rm -rf lib/python3.11/ensurepip 2>/dev/null || true
+        # Remove .dist-info except vllm
+        find $SP -maxdepth 1 -type d -name "*.dist-info" ! -name "vllm*" -exec rm -rf {} + 2>/dev/null || true
 
-        # Remove include/ directory (headers not needed at runtime)
+        # Remove Python stdlib we don't need
+        rm -rf lib/python3.12/test lib/python3.12/tkinter lib/python3.12/idlelib 2>/dev/null || true
+        rm -rf lib/python3.12/turtledemo lib/python3.12/ensurepip 2>/dev/null || true
         rm -rf include/ 2>/dev/null || true
 
-        # --- Strip debug symbols from ALL .so files (~1-2 GB savings) ---
-        echo "Stripping debug symbols from shared libraries..."
+        # Strip debug symbols
+        echo "Stripping debug symbols..."
         find . -name '*.so' -o -name '*.so.*' | while read -r f; do
           [ -f "$f" ] && [ ! -L "$f" ] && strip --strip-debug "$f" 2>/dev/null || true
         done
 
-        # Strip the python binary too
-        strip --strip-debug bin/python3.11 2>/dev/null || true
-
         echo "=== Size after cleanup ==="
         du -sh .
-        echo "Remaining top consumers:"
-        du -sh lib/python3.11/site-packages/torch/ 2>/dev/null || true
-        du -sh lib/rocblas/ 2>/dev/null || true
-        du -sh lib/hipblaslt/ 2>/dev/null || true
-        du -sh lib/libLLVM* 2>/dev/null || true
+        echo ""
+        echo "Top consumers:"
+        du -sh $SP/torch/ 2>/dev/null || true
+        du -sh $SP/vllm/ 2>/dev/null || true
+        du -sh $SP/_rocm_sdk_core/ 2>/dev/null || true
 
     - name: Verify bundled environment works
       run: |
-        echo "=== Sanity check: verify venv works after stripping ==="
-        export LD_LIBRARY_PATH="/opt/vllm/lib:${LD_LIBRARY_PATH:-}"
+        SP="/opt/vllm/lib/python3.12/site-packages"
+        ROCM_LIB="$SP/_rocm_sdk_core/lib"
+        export LD_LIBRARY_PATH="$ROCM_LIB:${LD_LIBRARY_PATH:-}"
+
         /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} OK')"
         /opt/vllm/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__} OK')"
-        /opt/vllm/bin/python3 -c "
-        from vllm.entrypoints.openai.api_server import build_async_engine_client
-        print('vLLM server entrypoint importable OK')
-        "
-        # Verify the launcher script syntax
         bash -n /opt/vllm/bin/vllm-server
         echo "All sanity checks passed"
 
-    - name: Report artifact size
+    - name: Report final size
       run: |
         echo "=== Final artifact ==="
         du -sh /opt/vllm/
         echo ""
-        echo "Size breakdown by top-level dir:"
         du -sh /opt/vllm/*/ 2>/dev/null
-        echo ""
-        echo "Largest items in lib/:"
-        du -sh /opt/vllm/lib/* 2>/dev/null | sort -rh | head -15
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
@@ -503,22 +205,19 @@ jobs:
     - name: Set job outputs
       id: set-outputs
       run: |
-        rocm_version="${DETECTED_ROCM_VERSION:-${{ env.ROCM_VERSION }}}"
-        echo "rocm_version=$rocm_version" >> $GITHUB_OUTPUT
-        echo "vllm_commit_hash=${VLLM_COMMIT_HASH}" >> $GITHUB_OUTPUT
-        echo "vllm_tag=${VLLM_TAG}" >> $GITHUB_OUTPUT
+        SP="/opt/vllm/lib/python3.12/site-packages"
+        ROCM_LIB="$SP/_rocm_sdk_core/lib"
+        export LD_LIBRARY_PATH="$ROCM_LIB:${LD_LIBRARY_PATH:-}"
+
+        vllm_ver=$(/opt/vllm/bin/python3 -c "import vllm; print(vllm.__version__)")
+        torch_ver=$(/opt/vllm/bin/python3 -c "import torch; print(torch.__version__)")
+        echo "vllm_version=$vllm_ver" >> $GITHUB_OUTPUT
+        echo "torch_version=$torch_ver" >> $GITHUB_OUTPUT
 
     - name: Clean up
       if: always()
       run: |
-        [ -d "/opt/rocm" ] && sudo rm -rf /opt/rocm
-        [ -d "vllm" ] && rm -rf vllm
         [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
-        echo "Cleanup completed"
-
-  # Hardware GPU tests are disabled until artifact size is reduced.
-  # The 7+ GB artifact takes too long to transfer to self-hosted runners.
-  # TODO: Re-enable once size is under ~2 GB or test approach is reworked.
 
   create-release:
     needs: [prepare-matrix, build-ubuntu]
@@ -562,18 +261,7 @@ jobs:
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 
-    - name: Check if tag already exists
-      id: check-tag
-      run: |
-        TAG="${{ steps.generate-tag.outputs.tag }}"
-        if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
-          echo "tag_exists=true" >> $GITHUB_OUTPUT
-        else
-          echo "tag_exists=false" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Create archives for all target artifacts
-      if: steps.check-tag.outputs.tag_exists == 'false'
+    - name: Create archives
       run: |
         targets="${{ env.GFX_TARGETS }}"
         TAG="${{ steps.generate-tag.outputs.tag }}"
@@ -581,31 +269,26 @@ jobs:
         IFS=',' read -ra TARGET_ARRAY <<< "$targets"
         for target in "${TARGET_ARRAY[@]}"; do
           target=$(echo "$target" | xargs)
-          artifact_name="vllm-ubuntu-rocm-${target}-x64"
-          artifact_dir="./all-artifacts/${artifact_name}"
-          final_archive="vllm-${TAG}-ubuntu-rocm-${target}-x64"
+          artifact_dir="./all-artifacts/vllm-ubuntu-rocm-${target}-x64"
+          archive="vllm-${TAG}-ubuntu-rocm-${target}-x64"
 
           if [ -d "$artifact_dir" ]; then
-            echo "Creating archive: ${final_archive}.tar.gz"
-            tar -czf "${final_archive}.tar.gz" -C "$artifact_dir" .
-            echo "Archive size: $(du -sh ${final_archive}.tar.gz | cut -f1)"
+            echo "Creating: ${archive}.tar.gz"
+            tar -czf "${archive}.tar.gz" -C "$artifact_dir" .
+            echo "Size: $(du -sh ${archive}.tar.gz | cut -f1)"
           else
-            echo "Warning: Artifact directory not found: $artifact_dir"
-            ls -la ./all-artifacts/
+            echo "Warning: $artifact_dir not found"
           fi
         done
-
-        echo "Created archives:"
-        ls -la *.tar.gz
+        ls -la *.tar.gz 2>/dev/null || echo "No archives created"
 
     - name: Create Release
-      if: steps.check-tag.outputs.tag_exists == 'false'
       env:
         GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
-        ROCM_VERSION="${{ needs.build-ubuntu.outputs.rocm_version }}"
-        VLLM_COMMIT_HASH="${{ needs.build-ubuntu.outputs.vllm_commit_hash }}"
+        VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
+        TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
         targets="${{ env.GFX_TARGETS }}"
 
         upload_files=""
@@ -620,9 +303,9 @@ jobs:
           --title "$TAG" \
           --notes "**Build Number**: $TAG
         **GPU Target(s)**: $targets
-        **ROCm Version**: $ROCM_VERSION
-        **vLLM Commit**: $VLLM_COMMIT_HASH
+        **vLLM Version**: $VLLM_VERSION
+        **PyTorch Version**: $TORCH_VERSION
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-        Portable vLLM builds with bundled ROCm runtime and Python environment. Extract and run \`bin/vllm-server\` — no separate ROCm or Python installation required." \
+        Portable vLLM builds using AMD's official ROCm wheels. Includes bundled Python, PyTorch ROCm, and ROCm runtime. No separate installation required." \
           $upload_files
