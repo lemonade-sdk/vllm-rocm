@@ -385,41 +385,100 @@ jobs:
     - name: Strip unnecessary files to reduce size
       run: |
         cd /opt/vllm
-        echo "Size before cleanup:"
+        echo "=== Size before cleanup ==="
         du -sh .
+        echo "Top consumers:"
+        du -sh lib/python3.11/site-packages/torch/ 2>/dev/null || true
+        du -sh lib/rocblas/ 2>/dev/null || true
+        du -sh lib/hipblaslt/ 2>/dev/null || true
+        du -sh lib/libLLVM* 2>/dev/null || true
+        du -sh lib/libclang* 2>/dev/null || true
 
-        # Remove __pycache__ directories
+        # --- PyTorch cleanup (biggest win, ~2-3 GB savings) ---
+        SP="lib/python3.11/site-packages"
+
+        # Remove PyTorch test/benchmark/docs data
+        rm -rf $SP/torch/test $SP/torch/testing $SP/torch/benchmarks 2>/dev/null || true
+        rm -rf $SP/torch/_inductor/autoheuristic/datasets 2>/dev/null || true
+        rm -rf $SP/torch/share 2>/dev/null || true
+
+        # Remove unused PyTorch backends (we only need ROCm/HIP)
+        rm -rf $SP/torch/lib/libtorch_cuda.so 2>/dev/null || true
+        rm -rf $SP/torch/lib/libcudnn*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libnvrtc*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libcublas*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libcusparse*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libcusolver*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libcufft*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libnccl*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libnvfuser*.so* 2>/dev/null || true
+        rm -rf $SP/torch/lib/libcaffe2_nvrtc.so 2>/dev/null || true
+
+        # Remove triton backends we don't need
+        rm -rf $SP/triton/backends/nvidia 2>/dev/null || true
+
+        # Remove torchvision unnecessary data
+        rm -rf $SP/torchvision/datasets 2>/dev/null || true
+        rm -rf $SP/torchvision/models/_api.py 2>/dev/null || true
+
+        # --- General Python cleanup ---
         find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-
-        # Remove .pyc files
         find . -name "*.pyc" -delete 2>/dev/null || true
+        find . -name "*.pyi" -delete 2>/dev/null || true
 
-        # Remove pip/setuptools caches
-        rm -rf lib/python3.11/site-packages/pip* 2>/dev/null || true
-        rm -rf lib/python3.11/site-packages/setuptools* 2>/dev/null || true
-        rm -rf lib/python3.11/site-packages/wheel* 2>/dev/null || true
+        # Remove pip/setuptools/wheel (not needed at runtime)
+        rm -rf $SP/pip* $SP/setuptools* $SP/wheel* $SP/pkg_resources* 2>/dev/null || true
+        rm -rf $SP/_distutils_hack 2>/dev/null || true
 
-        # Remove test directories from packages
-        find lib/python3.11/site-packages/ -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
-        find lib/python3.11/site-packages/ -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+        # Remove .dist-info metadata (saves ~100MB)
+        find $SP -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
 
-        echo "Size after cleanup:"
+        # Remove test/benchmark dirs from all packages
+        find $SP -maxdepth 2 -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+        find $SP -maxdepth 2 -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+        find $SP -maxdepth 2 -type d -name "benchmarks" -exec rm -rf {} + 2>/dev/null || true
+
+        # Remove Python stdlib modules we don't need
+        rm -rf lib/python3.11/test 2>/dev/null || true
+        rm -rf lib/python3.11/unittest 2>/dev/null || true
+        rm -rf lib/python3.11/tkinter 2>/dev/null || true
+        rm -rf lib/python3.11/idlelib 2>/dev/null || true
+        rm -rf lib/python3.11/turtledemo 2>/dev/null || true
+        rm -rf lib/python3.11/ensurepip 2>/dev/null || true
+
+        # Remove include/ directory (headers not needed at runtime)
+        rm -rf include/ 2>/dev/null || true
+
+        # --- Strip debug symbols from ALL .so files (~1-2 GB savings) ---
+        echo "Stripping debug symbols from shared libraries..."
+        find . -name '*.so' -o -name '*.so.*' | while read -r f; do
+          [ -f "$f" ] && [ ! -L "$f" ] && strip --strip-debug "$f" 2>/dev/null || true
+        done
+
+        # Strip the python binary too
+        strip --strip-debug bin/python3.11 2>/dev/null || true
+
+        echo "=== Size after cleanup ==="
         du -sh .
+        echo "Remaining top consumers:"
+        du -sh lib/python3.11/site-packages/torch/ 2>/dev/null || true
+        du -sh lib/rocblas/ 2>/dev/null || true
+        du -sh lib/hipblaslt/ 2>/dev/null || true
+        du -sh lib/libLLVM* 2>/dev/null || true
 
     - name: List artifact contents
       run: |
-        echo "=== Artifact structure ==="
-        echo "Top-level:"
-        ls -la /opt/vllm/
-        echo ""
-        echo "bin/ contents:"
-        ls -la /opt/vllm/bin/vllm-server /opt/vllm/bin/python3* 2>/dev/null
-        echo ""
-        echo "Key .so files in lib/:"
-        ls -la /opt/vllm/lib/lib*.so* 2>/dev/null | head -30
-        echo ""
-        echo "Total size:"
+        echo "=== Final artifact ==="
         du -sh /opt/vllm/
+        echo ""
+        echo "Size breakdown by top-level dir:"
+        du -sh /opt/vllm/*/ 2>/dev/null
+        echo ""
+        echo "Largest items in lib/:"
+        du -sh /opt/vllm/lib/* 2>/dev/null | sort -rh | head -15
+        echo ""
+        echo "bin/ entry points:"
+        ls -la /opt/vllm/bin/vllm-server /opt/vllm/bin/python3* 2>/dev/null
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
