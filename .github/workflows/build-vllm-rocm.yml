@@ -348,28 +348,21 @@ jobs:
       run: |
         cat > /opt/vllm/bin/vllm-server << 'LAUNCHER_EOF'
         #!/bin/bash
-        # vllm-server launcher — sets up the bundled Python + ROCm environment
-        # and delegates to vLLM's OpenAI-compatible API server.
-        #
-        # Usage: vllm-server --model <model> --port <port> --host <host> [vllm args...]
-
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         VENV_DIR="$(dirname "$SCRIPT_DIR")"
-
-        # Set library paths for bundled ROCm and Python libs
         export LD_LIBRARY_PATH="$VENV_DIR/lib:${LD_LIBRARY_PATH:-}"
-
-        # Point ROCm to bundled kernel libraries
         if [ -d "$VENV_DIR/lib/rocblas/library" ]; then
-          export ROCBLAS_TENSILE_LIBPATH="$VENV_DIR/lib/rocblas/library"
+        export ROCBLAS_TENSILE_LIBPATH="$VENV_DIR/lib/rocblas/library"
         fi
-
-        # Use the bundled Python
         exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
+        # Remove leading whitespace from YAML indentation
+        sed -i 's/^        //' /opt/vllm/bin/vllm-server
+
         chmod +x /opt/vllm/bin/vllm-server
         echo "Created vllm-server launcher"
+        cat /opt/vllm/bin/vllm-server
 
     - name: Set RPATH for portable distribution
       run: |
