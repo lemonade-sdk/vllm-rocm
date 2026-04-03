@@ -94,15 +94,13 @@ jobs:
     - name: Install build dependencies
       run: |
         sudo apt update
-        sudo apt install -y cmake ninja-build unzip curl patchelf \
-          python3.11 python3.11-venv python3.11-dev \
-          software-properties-common build-essential git-lfs
-        # Install Python 3.11 from deadsnakes if not available
-        if ! command -v python3.11 &> /dev/null; then
-          sudo add-apt-repository ppa:deadsnakes/ppa -y
-          sudo apt update
-          sudo apt install -y python3.11 python3.11-venv python3.11-dev
-        fi
+        sudo apt install -y software-properties-common build-essential \
+          cmake ninja-build unzip curl patchelf git-lfs
+
+        # Python 3.11 via deadsnakes PPA (not in ubuntu-22.04 default repos)
+        sudo add-apt-repository ppa:deadsnakes/ppa -y
+        sudo apt update
+        sudo apt install -y python3.11 python3.11-venv python3.11-dev
         python3.11 --version
 
     - name: Download and extract ROCm directly to /opt/rocm
