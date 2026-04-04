@@ -256,26 +256,38 @@ jobs:
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 
-    - name: Create archives
+    - name: Create archives (split if >1.9 GB for GitHub release limit)
       run: |
         targets="${{ env.GFX_TARGETS }}"
         TAG="${{ steps.generate-tag.outputs.tag }}"
+        MAX_SIZE=1900  # MB — GitHub limit is 2 GB per asset
 
         IFS=',' read -ra TARGET_ARRAY <<< "$targets"
         for target in "${TARGET_ARRAY[@]}"; do
           target=$(echo "$target" | xargs)
           artifact_dir="./all-artifacts/vllm-ubuntu-rocm-${target}-x64"
-          archive="vllm-${TAG}-ubuntu-rocm-${target}-x64"
+          base="vllm-${TAG}-ubuntu-rocm-${target}-x64"
 
           if [ -d "$artifact_dir" ]; then
-            echo "Creating: ${archive}.tar.gz"
-            tar -czf "${archive}.tar.gz" -C "$artifact_dir" .
-            echo "Size: $(du -sh ${archive}.tar.gz | cut -f1)"
+            echo "Creating: ${base}.tar.gz"
+            tar -czf "${base}.tar.gz" -C "$artifact_dir" .
+            size_mb=$(du -m "${base}.tar.gz" | cut -f1)
+            echo "Archive size: ${size_mb} MB"
+
+            if [ "$size_mb" -gt "$MAX_SIZE" ]; then
+              echo "Splitting into ${MAX_SIZE}MB parts..."
+              split -b ${MAX_SIZE}M -d --additional-suffix=.tar.gz \
+                "${base}.tar.gz" "${base}.part"
+              rm "${base}.tar.gz"
+              echo "Parts created:"
+              ls -la ${base}.part*
+            fi
           else
             echo "Warning: $artifact_dir not found"
           fi
         done
-        ls -la *.tar.gz 2>/dev/null || echo "No archives created"
+        echo "=== Release assets ==="
+        ls -la *.tar.gz 2>/dev/null || echo "No archives"
 
     - name: Create Release
       env:
@@ -286,13 +298,9 @@ jobs:
         TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
         targets="${{ env.GFX_TARGETS }}"
 
-        upload_files=""
-        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
-        for target in "${TARGET_ARRAY[@]}"; do
-          target=$(echo "$target" | xargs)
-          archive="vllm-${TAG}-ubuntu-rocm-${target}-x64.tar.gz"
-          [ -f "$archive" ] && upload_files="$upload_files $archive"
-        done
+        # Collect all .tar.gz files (may be split parts)
+        upload_files=$(ls -1 vllm-*.tar.gz 2>/dev/null | tr '\n' ' ')
+        echo "Files to upload: $upload_files"
 
         gh release create "$TAG" \
           --title "$TAG" \
