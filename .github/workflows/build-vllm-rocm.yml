@@ -240,7 +240,7 @@ jobs:
     - name: Generate release tag
       id: generate-tag
       env:
-        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || echo "")
 
@@ -279,7 +279,7 @@ jobs:
 
     - name: Create Release
       env:
-        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
         VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
