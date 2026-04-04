@@ -148,11 +148,9 @@ jobs:
         find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
         find . -name "*.pyc" -delete 2>/dev/null || true
 
-        # Remove test/benchmark dirs
-        find $SP -maxdepth 2 -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
-        find $SP -maxdepth 2 -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
-        find $SP -maxdepth 2 -type d -name "benchmarks" -exec rm -rf {} + 2>/dev/null || true
-        rm -rf $SP/torch/test $SP/torch/testing 2>/dev/null || true
+        # Remove test/benchmark dirs (but NOT torch.testing — it's imported at runtime)
+        rm -rf $SP/torch/test 2>/dev/null || true
+        rm -rf $SP/torch/benchmarks 2>/dev/null || true
 
         # Remove .dist-info except vllm
         find $SP -maxdepth 1 -type d -name "*.dist-info" ! -name "vllm*" -exec rm -rf {} + 2>/dev/null || true
