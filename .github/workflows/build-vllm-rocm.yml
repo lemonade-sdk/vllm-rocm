@@ -107,7 +107,7 @@ jobs:
         /opt/vllm/bin/pip install \
           --extra-index-url https://wheels.vllm.ai/rocm/ \
           vllm
-        /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__}')"
+        echo "vLLM installed (import check deferred until after torch reinstall)"
 
     - name: Reinstall AMD PyTorch ROCm (compatible with pip ROCm SDK)
       run: |
@@ -115,10 +115,15 @@ jobs:
         /opt/vllm/bin/pip install --force-reinstall --no-deps \
           --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
           torch
+        SP="/opt/vllm/lib/python3.12/site-packages"
+        for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
+          [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
+        done
+        export LD_LIBRARY_PATH
         /opt/vllm/bin/python3 -c "
-        import torch
-        print(f'PyTorch {torch.__version__}')
-        print(f'ROCm built-in: {torch.version.hip is not None}')
+        import torch; print(f'PyTorch {torch.__version__}')
+        import vllm; print(f'vLLM {vllm.__version__}')
+        print('Both imports OK')
         "
 
     - name: Create launcher script
