@@ -115,7 +115,13 @@ jobs:
         /opt/vllm/bin/pip install --force-reinstall --no-deps \
           --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
           torch
+
+        # Remove the vLLM-bundled amdsmi (v26.2.2 from ROCm 7.2.1) —
+        # it conflicts with the AMD pip ROCm SDK amdsmi (v26.3.0).
+        # The ROCm SDK version in _rocm_sdk_core/share/amd_smi/ is used instead.
         SP="/opt/vllm/lib/python3.12/site-packages"
+        rm -rf $SP/amdsmi $SP/amdsmi-*.dist-info
+
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
@@ -170,10 +176,8 @@ jobs:
 
         SP="lib/python3.12/site-packages"
 
-        # Remove pip/setuptools/wheel
-        rm -rf $SP/pip* $SP/setuptools* $SP/wheel* $SP/pkg_resources* 2>/dev/null || true
-        rm -f $SP/distutils-precedence.pth 2>/dev/null || true
-        rm -rf $SP/_distutils_hack 2>/dev/null || true
+        # Remove pip/wheel (keep setuptools — torch.utils.cpp_extension needs it)
+        rm -rf $SP/pip* $SP/wheel* 2>/dev/null || true
 
         # Remove __pycache__ and .pyc
         find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
