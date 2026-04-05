@@ -101,13 +101,25 @@ jobs:
         print(f'ROCm built-in: {torch.version.hip is not None}')
         "
 
-    - name: Install vLLM ROCm from AMD
+    - name: Install vLLM ROCm (official wheel with ROCm native extensions)
       run: |
-        echo "Installing vLLM from AMD ROCm wheel index..."
+        echo "Installing vLLM from official ROCm wheel index..."
         /opt/vllm/bin/pip install \
-          --extra-index-url "${{ steps.wheel-urls.outputs.vllm_index }}" \
+          --extra-index-url https://wheels.vllm.ai/rocm/ \
           vllm
         /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__}')"
+
+    - name: Reinstall AMD PyTorch ROCm (compatible with pip ROCm SDK)
+      run: |
+        echo "Reinstalling AMD torch to match bundled ROCm SDK libraries..."
+        /opt/vllm/bin/pip install --force-reinstall --no-deps \
+          --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
+          torch
+        /opt/vllm/bin/python3 -c "
+        import torch
+        print(f'PyTorch {torch.__version__}')
+        print(f'ROCm built-in: {torch.version.hip is not None}')
+        "
 
     - name: Create launcher script
       run: |
@@ -188,11 +200,23 @@ jobs:
     - name: Verify bundled environment works
       run: |
         SP="/opt/vllm/lib/python3.12/site-packages"
-        ROCM_LIB="$SP/_rocm_sdk_core/lib"
-        export LD_LIBRARY_PATH="$ROCM_LIB:${LD_LIBRARY_PATH:-}"
+        for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
+          [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
+        done
+        export LD_LIBRARY_PATH
 
         /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} OK')"
         /opt/vllm/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__} OK')"
+        /opt/vllm/bin/python3 -c "
+        # Verify native extensions exist (they load only with GPU present)
+        import os, pathlib
+        sp = pathlib.Path('$SP/vllm')
+        for ext in ['_C.abi3.so', '_rocm_C.abi3.so']:
+            p = sp / ext
+            assert p.exists(), f'Missing {ext}'
+            print(f'{ext}: {p.stat().st_size // 1048576} MB')
+        print('Native extensions verified')
+        "
         bash -n /opt/vllm/bin/vllm-server
         echo "All sanity checks passed"
 
@@ -215,8 +239,10 @@ jobs:
       id: set-outputs
       run: |
         SP="/opt/vllm/lib/python3.12/site-packages"
-        ROCM_LIB="$SP/_rocm_sdk_core/lib"
-        export LD_LIBRARY_PATH="$ROCM_LIB:${LD_LIBRARY_PATH:-}"
+        for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
+          [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
+        done
+        export LD_LIBRARY_PATH
 
         vllm_ver=$(/opt/vllm/bin/python3 -c "import vllm; print(vllm.__version__)")
         torch_ver=$(/opt/vllm/bin/python3 -c "import torch; print(torch.__version__)")
