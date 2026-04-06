@@ -197,9 +197,13 @@ jobs:
         for libdir in "$SP"/_rocm_sdk_*/lib "$SP"/torch/lib; do
         [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
+        # Also add LLVM lib for the bundled clang
+        LD_LIBRARY_PATH="$SP/_rocm_sdk_core/lib/llvm/lib:${LD_LIBRARY_PATH}"
         export LD_LIBRARY_PATH
         export PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
         export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+        # Use bundled clang for Triton JIT (no system gcc needed)
+        export CC="$SP/_rocm_sdk_core/lib/llvm/bin/clang"
         exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
@@ -236,6 +240,9 @@ jobs:
         rm -rf lib/python3.12/turtledemo lib/python3.12/ensurepip 2>/dev/null || true
         # Keep include/ — Triton JIT-compiles C launcher stubs at runtime
         # and needs Python.h headers.
+
+        # Ensure bundled clang is executable (permissions lost during tar)
+        chmod +x $SP/_rocm_sdk_core/lib/llvm/bin/clang* 2>/dev/null || true
 
         # NOTE: Do NOT strip .so files — AMD ROCm wheels use special ELF
         # alignment that strip corrupts, and numpy/scipy also break.
@@ -333,17 +340,26 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || echo "")
+        VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
+        TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
 
-        if [ -z "$existing_tags" ]; then
-          next_number=1000
+        # Extract ROCm version from torch version string (e.g. 2.10.0+rocm7.12.0 -> rocm7.12.0)
+        ROCM_VERSION=$(echo "$TORCH_VERSION" | grep -oP 'rocm[\d.]+' || echo "rocm")
+
+        # Tag format: vllm{version}-{rocm_version}-b{N}
+        # e.g. vllm0.19.0-rocm7.12.0-b1
+        PREFIX="vllm${VLLM_VERSION}-${ROCM_VERSION}"
+        existing=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' \
+          | grep -E "^${PREFIX}-b[0-9]+$" | sort -t'b' -k2 -n || echo "")
+
+        if [ -z "$existing" ]; then
+          next=1
         else
-          highest_tag=$(echo "$existing_tags" | tail -n 1)
-          highest_number=$(echo "$highest_tag" | sed 's/^b//')
-          next_number=$((highest_number + 1))
+          last=$(echo "$existing" | tail -n 1 | grep -oP 'b\K[0-9]+')
+          next=$((last + 1))
         fi
 
-        TAG=$(printf "b%04d" $next_number)
+        TAG="${PREFIX}-b${next}"
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 
@@ -357,7 +373,7 @@ jobs:
         for target in "${TARGET_ARRAY[@]}"; do
           target=$(echo "$target" | xargs)
           artifact_dir="./all-artifacts/vllm-ubuntu-rocm-${target}-x64"
-          base="vllm-${TAG}-ubuntu-rocm-${target}-x64"
+          base="${TAG}-${target}-x64"
 
           if [ -d "$artifact_dir" ]; then
             echo "Creating: ${base}.tar.gz"
