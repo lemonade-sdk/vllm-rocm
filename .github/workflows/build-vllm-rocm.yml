@@ -54,12 +54,16 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Python 3.12
+    - name: Download portable Python 3.12 (python-build-standalone)
       run: |
-        sudo add-apt-repository ppa:deadsnakes/ppa -y
-        sudo apt update
-        sudo apt install -y python3.12 python3.12-venv python3.12-dev
-        python3.12 --version
+        # Use astral-sh/python-build-standalone for a relocatable Python
+        # that works across Linux distros without system Python dependency.
+        PBS_TAG="20250604"
+        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.12.11+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+        echo "Downloading portable Python from $PBS_URL"
+        curl -fsSL "$PBS_URL" | tar -xz -C /opt
+        /opt/python/bin/python3.12 --version
+        echo "Portable Python installed at /opt/python"
 
     - name: Map GPU target to AMD wheel URLs
       id: wheel-urls
@@ -85,7 +89,10 @@ jobs:
 
     - name: Create Python virtual environment
       run: |
-        python3.12 -m venv --copies /opt/vllm
+        /opt/python/bin/python3.12 -m venv --copies /opt/vllm
+        # Make the venv relocatable: point home to the venv's own bin dir
+        # so the bundled Python doesn't depend on /opt/python at runtime.
+        sed -i 's|^home = .*|home = /opt/vllm/bin|' /opt/vllm/pyvenv.cfg
         /opt/vllm/bin/python3 -m pip install --upgrade pip
         echo "Python: $(/opt/vllm/bin/python3 --version)"
 
@@ -144,22 +151,9 @@ jobs:
         [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
-        export PYTHONPATH="$SP:$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
+        export PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
         export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-        # Use system python3.12 for portability (bundled binary may not
-        # work across different Ubuntu versions / glibc builds).
-        PYTHON=""
-        for candidate in python3.12 python3; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-        PYTHON="$candidate"
-        break
-        fi
-        done
-        if [ -z "$PYTHON" ]; then
-        echo "ERROR: python3.12 or python3 not found in PATH" >&2
-        exit 1
-        fi
-        exec "$PYTHON" -m vllm.entrypoints.openai.api_server "$@"
+        exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
         # Remove YAML indentation from heredoc
