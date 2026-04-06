@@ -406,7 +406,7 @@ jobs:
         targets="${{ env.GFX_TARGETS }}"
 
         # Collect all .tar.gz files (may be split parts)
-        upload_files=$(ls -1 vllm-*.tar.gz 2>/dev/null | tr '\n' ' ')
+        upload_files=$(ls -1 vllm*.tar.gz 2>/dev/null | tr '\n' ' ')
         echo "Files to upload: $upload_files"
 
         gh release create "$TAG" \
