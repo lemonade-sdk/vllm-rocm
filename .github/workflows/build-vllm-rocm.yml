@@ -203,7 +203,9 @@ jobs:
         export PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
         export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
         # Use bundled clang for Triton JIT (no system gcc needed)
-        export CC="$SP/_rocm_sdk_core/lib/llvm/bin/clang"
+        CLANG="$SP/_rocm_sdk_core/lib/llvm/bin/clang"
+        [ -f "$CLANG" ] && chmod +x "$CLANG" "$CLANG"-22 2>/dev/null
+        export CC="$CLANG"
         exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
