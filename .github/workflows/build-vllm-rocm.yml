@@ -148,10 +148,13 @@ jobs:
         export LD_LIBRARY_PATH
 
         # Create unversioned symlinks for ROCm libs (pip installs only have versioned .so.N)
-        for lib in $SP/_rocm_sdk_core/lib/*.so.*; do
-          base="${lib%%.*}.so"
-          [ ! -e "$base" ] && ln -sf "$(basename "$lib")" "$base"
+        ROCM_LIB="$SP/_rocm_sdk_core/lib"
+        for lib in "$ROCM_LIB"/*.so.*; do
+          name=$(basename "$lib")
+          link="$ROCM_LIB/${name%%.*}.so"
+          [ ! -e "$link" ] && ln -sf "$name" "$link"
         done
+        ls -la "$ROCM_LIB/libamdhip64.so" || echo "WARNING: symlink not created"
 
         # Compile the hip_utils C module and save the .so into the package
         /opt/vllm/bin/python3 << 'PYEOF'
