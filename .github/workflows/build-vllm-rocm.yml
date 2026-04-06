@@ -138,19 +138,63 @@ jobs:
         print('Both imports OK')
         "
 
-    - name: Pre-compile Triton HIP utilities
+    - name: Pre-compile Triton HIP utilities (eliminates gcc dependency)
       run: |
-        # Triton JIT-compiles a small C module (hip_utils) at first use.
-        # Pre-compile it here so the target machine doesn't need gcc.
         SP="/opt/vllm/lib/python3.12/site-packages"
+        TRITON_AMD="$SP/triton/backends/amd"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
-        /opt/vllm/bin/python3 -c "
-        from triton.backends.amd.driver import HIPUtils
-        print('Triton HIP utils pre-compiled')
-        " || echo "Warning: Triton HIP pre-compile failed (non-fatal on headless CI)"
+
+        # Compile the hip_utils C module and save the .so into the package
+        /opt/vllm/bin/python3 << 'PYEOF'
+        import importlib, os, sys
+        from triton.runtime.build import compile_module_from_src
+        from pathlib import Path
+
+        dirname = os.path.join(os.path.dirname(__import__('triton').backends.amd.driver.__file__))
+        src = Path(os.path.join(dirname, "driver.c")).read_text()
+        # Fill in the HIP library path placeholder
+        from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+        libhip_path = _get_path_to_hip_runtime_dylib()
+        src = src.replace('/*py_libhip_search_path*/', libhip_path, 1)
+        include_dirs = [os.path.join(dirname, "include")]
+        mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)
+        # Copy the compiled .so to a stable location inside the package
+        import shutil
+        src_so = mod.__file__
+        dst_so = os.path.join(dirname, "hip_utils_prebuilt.so")
+        shutil.copy2(src_so, dst_so)
+        print(f"Pre-compiled: {dst_so} ({os.path.getsize(dst_so)} bytes)")
+        PYEOF
+
+        # Patch Triton to load the pre-built .so instead of JIT-compiling
+        /opt/vllm/bin/python3 << 'PYEOF'
+        import os
+        driver_py = os.path.join(
+            os.path.dirname(__import__('triton').backends.amd.driver.__file__),
+            "driver.py"
+        )
+        with open(driver_py, 'r') as f:
+            code = f.read()
+        # Replace the compile_module_from_src call with loading the pre-built .so
+        old = "mod = compile_module_from_src(src=src, name=\"hip_utils\", include_dirs=include_dirs)"
+        new = """# Load pre-built hip_utils to avoid JIT compilation (no gcc needed)
+        _prebuilt = os.path.join(dirname, "hip_utils_prebuilt.so")
+        if os.path.exists(_prebuilt):
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location("hip_utils", _prebuilt)
+            mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(mod)
+        else:
+            mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)"""
+        assert old in code, f"Could not find target string in driver.py"
+        code = code.replace(old, new)
+        with open(driver_py, 'w') as f:
+            f.write(code)
+        print("Patched triton/backends/amd/driver.py")
+        PYEOF
 
     - name: Create launcher script
       run: |
