@@ -182,31 +182,33 @@ jobs:
         echo "Pre-compiled: $TRITON_AMD/hip_utils_prebuilt.so ($(stat -c%s "$TRITON_AMD/hip_utils_prebuilt.so") bytes)"
 
         # Patch Triton to load the pre-built .so instead of JIT-compiling
-        /opt/vllm/bin/python3 << 'PYEOF'
-        import os
-        driver_py = os.path.join(
-            os.path.dirname(__import__('triton').backends.amd.driver.__file__),
-            "driver.py"
-        )
-        with open(driver_py, 'r') as f:
-            code = f.read()
-        # Replace the compile_module_from_src call with loading the pre-built .so
-        old = "mod = compile_module_from_src(src=src, name=\"hip_utils\", include_dirs=include_dirs)"
-        new = """# Load pre-built hip_utils to avoid JIT compilation (no gcc needed)
-        _prebuilt = os.path.join(dirname, "hip_utils_prebuilt.so")
-        if os.path.exists(_prebuilt):
-            import importlib.util as _ilu
-            _spec = _ilu.spec_from_file_location("hip_utils", _prebuilt)
-            mod = _ilu.module_from_spec(_spec)
-            _spec.loader.exec_module(mod)
-        else:
-            mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)"""
-        assert old in code, f"Could not find target string in driver.py"
+        /opt/vllm/bin/python3 -c "
+        import os, textwrap
+        driver_py = os.path.join(os.path.dirname(__import__('triton').backends.amd.driver.__file__), 'driver.py')
+        with open(driver_py) as f: code = f.read()
+        old = 'mod = compile_module_from_src(src=src, name=\"hip_utils\", include_dirs=include_dirs)'
+        # Detect the indentation of the original line
+        for line in code.splitlines():
+            if old in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                break
+        new = textwrap.dedent('''
+            _prebuilt = os.path.join(dirname, 'hip_utils_prebuilt.so')
+            if os.path.exists(_prebuilt):
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location('hip_utils', _prebuilt)
+                mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(mod)
+            else:
+                mod = compile_module_from_src(src=src, name='hip_utils', include_dirs=include_dirs)
+        ''').strip()
+        # Re-indent to match original
+        new = '\n'.join(indent + l if l.strip() else l for l in new.splitlines())
+        assert old in code, 'Target string not found in driver.py'
         code = code.replace(old, new)
-        with open(driver_py, 'w') as f:
-            f.write(code)
-        print("Patched triton/backends/amd/driver.py")
-        PYEOF
+        with open(driver_py, 'w') as f: f.write(code)
+        print('Patched triton/backends/amd/driver.py')
+        "
 
     - name: Create launcher script
       run: |
