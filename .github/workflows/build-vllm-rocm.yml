@@ -61,9 +61,11 @@ jobs:
         PBS_TAG="20250604"
         PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.12.11+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
         echo "Downloading portable Python from $PBS_URL"
+        # Extracts to python/ — move to /opt/vllm so it becomes the release root
         curl -fsSL "$PBS_URL" | tar -xz -C /opt
-        /opt/python/bin/python3.12 --version
-        echo "Portable Python installed at /opt/python"
+        mv /opt/python /opt/vllm
+        /opt/vllm/bin/python3.12 --version
+        echo "Portable Python installed at /opt/vllm"
 
     - name: Map GPU target to AMD wheel URLs
       id: wheel-urls
@@ -87,12 +89,9 @@ jobs:
         echo "Using PyTorch index: https://repo.amd.com/rocm/whl/${suffix}/"
         echo "Using vLLM index: https://rocm.frameworks.amd.com/whl/${suffix}/"
 
-    - name: Create Python virtual environment
+    - name: Prepare Python environment
       run: |
-        /opt/python/bin/python3.12 -m venv --copies /opt/vllm
-        # Make the venv relocatable: point home to the venv's own bin dir
-        # so the bundled Python doesn't depend on /opt/python at runtime.
-        sed -i 's|^home = .*|home = /opt/vllm/bin|' /opt/vllm/pyvenv.cfg
+        # No venv needed — install packages directly into the standalone Python.
         /opt/vllm/bin/python3 -m pip install --upgrade pip
         echo "Python: $(/opt/vllm/bin/python3 --version)"
 
