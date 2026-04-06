@@ -234,7 +234,8 @@ jobs:
         # Remove Python stdlib we don't need
         rm -rf lib/python3.12/test lib/python3.12/tkinter lib/python3.12/idlelib 2>/dev/null || true
         rm -rf lib/python3.12/turtledemo lib/python3.12/ensurepip 2>/dev/null || true
-        rm -rf include/ 2>/dev/null || true
+        # Keep include/ — Triton JIT-compiles C launcher stubs at runtime
+        # and needs Python.h headers.
 
         # NOTE: Do NOT strip .so files — AMD ROCm wheels use special ELF
         # alignment that strip corrupts, and numpy/scipy also break.
