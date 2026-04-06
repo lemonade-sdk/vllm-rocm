@@ -156,27 +156,30 @@ jobs:
         done
         ls -la "$ROCM_LIB/libamdhip64.so" || echo "WARNING: symlink not created"
 
-        # Compile the hip_utils C module and save the .so into the package
-        /opt/vllm/bin/python3 << 'PYEOF'
-        import importlib, os, sys
-        from triton.runtime.build import compile_module_from_src
-        from pathlib import Path
+        # Compile the hip_utils C module with gcc directly and save into the package.
+        # We can't use Triton's compile_module_from_src because it also tries to
+        # dlopen the HIP library, which doesn't work on headless CI.
+        TRITON_AMD="$SP/triton/backends/amd"
+        PYTHON_INC="/opt/vllm/include/python3.12"
 
-        dirname = os.path.join(os.path.dirname(__import__('triton').backends.amd.driver.__file__))
-        src = Path(os.path.join(dirname, "driver.c")).read_text()
-        # Fill in the HIP library path placeholder
-        from triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
-        libhip_path = _get_path_to_hip_runtime_dylib()
-        src = src.replace('/*py_libhip_search_path*/', libhip_path, 1)
-        include_dirs = [os.path.join(dirname, "include")]
-        mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)
-        # Copy the compiled .so to a stable location inside the package
-        import shutil
-        src_so = mod.__file__
-        dst_so = os.path.join(dirname, "hip_utils_prebuilt.so")
-        shutil.copy2(src_so, dst_so)
-        print(f"Pre-compiled: {dst_so} ({os.path.getsize(dst_so)} bytes)")
-        PYEOF
+        # Generate the C source with the HIP library path baked in
+        /opt/vllm/bin/python3 -c "
+        from pathlib import Path
+        import os
+        dirname = '$TRITON_AMD'
+        src = Path(os.path.join(dirname, 'driver.c')).read_text()
+        # Bake in the relative path that will resolve at runtime via LD_LIBRARY_PATH
+        src = src.replace('/*py_libhip_search_path*/', 'libamdhip64.so', 1)
+        Path('/tmp/hip_utils.c').write_text(src)
+        print('Generated /tmp/hip_utils.c')
+        "
+
+        # Compile with gcc
+        gcc /tmp/hip_utils.c -O3 -shared -fPIC -Wno-psabi \
+          -o "$TRITON_AMD/hip_utils_prebuilt.so" \
+          -I"$TRITON_AMD/include" \
+          -I"$PYTHON_INC"
+        echo "Pre-compiled: $TRITON_AMD/hip_utils_prebuilt.so ($(stat -c%s "$TRITON_AMD/hip_utils_prebuilt.so") bytes)"
 
         # Patch Triton to load the pre-built .so instead of JIT-compiling
         /opt/vllm/bin/python3 << 'PYEOF'
