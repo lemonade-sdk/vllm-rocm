@@ -59,7 +59,7 @@ jobs:
         # Use astral-sh/python-build-standalone for a relocatable Python
         # that works across Linux distros without system Python dependency.
         PBS_TAG="20250604"
-        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.12.11+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.12.11+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
         echo "Downloading portable Python from $PBS_URL"
         # Extracts to python/ — move to /opt/vllm so it becomes the release root
         curl -fsSL "$PBS_URL" | tar -xz -C /opt
@@ -137,6 +137,20 @@ jobs:
         import vllm; print(f'vLLM {vllm.__version__}')
         print('Both imports OK')
         "
+
+    - name: Pre-compile Triton HIP utilities
+      run: |
+        # Triton JIT-compiles a small C module (hip_utils) at first use.
+        # Pre-compile it here so the target machine doesn't need gcc.
+        SP="/opt/vllm/lib/python3.12/site-packages"
+        for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
+          [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
+        done
+        export LD_LIBRARY_PATH
+        /opt/vllm/bin/python3 -c "
+        from triton.backends.amd.driver import HIPUtils
+        print('Triton HIP utils pre-compiled')
+        " || echo "Warning: Triton HIP pre-compile failed (non-fatal on headless CI)"
 
     - name: Create launcher script
       run: |
