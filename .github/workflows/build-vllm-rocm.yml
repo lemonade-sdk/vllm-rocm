@@ -320,6 +320,9 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    strategy:
+      matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
+      fail-fast: false
     if: |
       always() &&
       needs.build-ubuntu.result == 'success' &&
@@ -332,10 +335,11 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Download all build artifacts
+    - name: Download build artifact for ${{ matrix.gfx_target }}
       uses: actions/download-artifact@v4
       with:
-        path: ./all-artifacts
+        name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+        path: ./artifact
 
     - name: Generate release tag
       id: generate-tag
@@ -344,57 +348,37 @@ jobs:
       run: |
         VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
         TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
+        TARGET="${{ matrix.gfx_target }}"
 
-        # Extract ROCm version from torch version string (e.g. 2.10.0+rocm7.12.0 -> rocm7.12.0)
+        # Extract ROCm version from torch version string
         ROCM_VERSION=$(echo "$TORCH_VERSION" | grep -oP 'rocm[\d.]+' || echo "rocm")
 
-        # Tag format: vllm{version}-{rocm_version}-b{N}
-        # e.g. vllm0.19.0-rocm7.12.0-b1
-        PREFIX="vllm${VLLM_VERSION}-${ROCM_VERSION}"
-        existing=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' \
-          | grep -E "^${PREFIX}-b[0-9]+$" | sort -t'b' -k2 -n || echo "")
-
-        if [ -z "$existing" ]; then
-          next=1
-        else
-          last=$(echo "$existing" | tail -n 1 | grep -oP 'b\K[0-9]+')
-          next=$((last + 1))
-        fi
-
-        TAG="${PREFIX}-b${next}"
+        # Tag format: vllm{version}-{rocm_version}-{gfx_target}
+        # e.g. vllm0.19.0-rocm7.12.0-gfx1150
+        TAG="vllm${VLLM_VERSION}-${ROCM_VERSION}-${TARGET}"
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 
-    - name: Create archives (split if >1.9 GB for GitHub release limit)
+    - name: Create archive (split if >1.9 GB for GitHub release limit)
       run: |
-        targets="${{ env.GFX_TARGETS }}"
         TAG="${{ steps.generate-tag.outputs.tag }}"
         MAX_SIZE=1900  # MB — GitHub limit is 2 GB per asset
+        base="${TAG}-x64"
 
-        IFS=',' read -ra TARGET_ARRAY <<< "$targets"
-        for target in "${TARGET_ARRAY[@]}"; do
-          target=$(echo "$target" | xargs)
-          artifact_dir="./all-artifacts/vllm-ubuntu-rocm-${target}-x64"
-          base="${TAG}-${target}-x64"
+        echo "Creating: ${base}.tar.gz"
+        tar -czf "${base}.tar.gz" -C ./artifact .
+        size_mb=$(du -m "${base}.tar.gz" | cut -f1)
+        echo "Archive size: ${size_mb} MB"
 
-          if [ -d "$artifact_dir" ]; then
-            echo "Creating: ${base}.tar.gz"
-            tar -czf "${base}.tar.gz" -C "$artifact_dir" .
-            size_mb=$(du -m "${base}.tar.gz" | cut -f1)
-            echo "Archive size: ${size_mb} MB"
+        if [ "$size_mb" -gt "$MAX_SIZE" ]; then
+          echo "Splitting into ${MAX_SIZE}MB parts..."
+          split -b ${MAX_SIZE}M -d --additional-suffix=.tar.gz \
+            "${base}.tar.gz" "${base}.part"
+          rm "${base}.tar.gz"
+          echo "Parts created:"
+          ls -la ${base}.part*
+        fi
 
-            if [ "$size_mb" -gt "$MAX_SIZE" ]; then
-              echo "Splitting into ${MAX_SIZE}MB parts..."
-              split -b ${MAX_SIZE}M -d --additional-suffix=.tar.gz \
-                "${base}.tar.gz" "${base}.part"
-              rm "${base}.tar.gz"
-              echo "Parts created:"
-              ls -la ${base}.part*
-            fi
-          else
-            echo "Warning: $artifact_dir not found"
-          fi
-        done
         echo "=== Release assets ==="
         ls -la *.tar.gz 2>/dev/null || echo "No archives"
 
@@ -405,19 +389,20 @@ jobs:
         TAG="${{ steps.generate-tag.outputs.tag }}"
         VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
         TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
-        targets="${{ env.GFX_TARGETS }}"
+        TARGET="${{ matrix.gfx_target }}"
 
-        # Collect all .tar.gz files (may be split parts)
-        upload_files=$(ls -1 vllm*.tar.gz 2>/dev/null | tr '\n' ' ')
+        upload_files=$(ls -1 *.tar.gz 2>/dev/null | tr '\n' ' ')
         echo "Files to upload: $upload_files"
+
+        # Delete existing release with same tag (idempotent rebuilds)
+        gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
 
         gh release create "$TAG" \
           --title "$TAG" \
-          --notes "**Build Number**: $TAG
-        **GPU Target(s)**: $targets
+          --notes "**GPU Target**: $TARGET
         **vLLM Version**: $VLLM_VERSION
         **PyTorch Version**: $TORCH_VERSION
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-        Portable vLLM builds using AMD's official ROCm wheels. Includes bundled Python, PyTorch ROCm, and ROCm runtime. No separate installation required." \
+        Portable vLLM build for $TARGET. Includes bundled Python, PyTorch ROCm, and ROCm runtime. No separate installation required." \
           $upload_files
