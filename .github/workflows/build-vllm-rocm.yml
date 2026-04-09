@@ -232,20 +232,39 @@ jobs:
         find . -name "*.pyc" -delete 2>/dev/null || true
 
         # Remove test/benchmark dirs (but NOT torch.testing — it's imported at runtime)
-        rm -rf $SP/torch/test 2>/dev/null || true
-        rm -rf $SP/torch/benchmarks 2>/dev/null || true
+        rm -rf $SP/torch/test $SP/torch/benchmarks 2>/dev/null || true
 
-        # Keep .dist-info — importlib.metadata needs them at runtime
-        # (e.g. pydantic checks email-validator version via metadata).
+        # Remove packages not needed for inference serving (~500MB)
+        rm -rf $SP/pyarrow* $SP/opencv* $SP/cv2* 2>/dev/null || true
+        rm -rf $SP/onnx* $SP/pandas* $SP/plotly* 2>/dev/null || true
+        rm -rf $SP/datasets* $SP/evaluate* $SP/peft* $SP/timm* 2>/dev/null || true
+        rm -rf $SP/boto3* $SP/botocore* $SP/s3transfer* 2>/dev/null || true
+        rm -rf $SP/azure* $SP/google_cloud* $SP/google_auth* $SP/msal* 2>/dev/null || true
+        rm -rf $SP/tensorizer* $SP/runai* 2>/dev/null || true
+        rm -rf $SP/aiter_meta* 2>/dev/null || true
+
+        # Trim LLVM toolchain: keep only clang + its libs (~350MB saved)
+        LLVM="$SP/_rocm_sdk_core/lib/llvm"
+        # Keep only clang, clang-22, remove everything else from bin/
+        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-22" -delete 2>/dev/null || true
+        find "$LLVM/bin" -type l ! -name "clang" -delete 2>/dev/null || true
+        # Keep only libs that clang needs (libclang-cpp, libLLVM, rocm_sysdeps)
+        find "$LLVM/lib" -name "*.so*" \
+          ! -name "libclang-cpp*" \
+          ! -name "libLLVM*" \
+          -delete 2>/dev/null || true
+        rm -rf "$LLVM/lib/clang/22/include/cuda_wrappers" 2>/dev/null || true
+
+        # Trim ROCm SDK bin/ (Python wrapper scripts, not needed)
+        rm -rf "$SP/_rocm_sdk_core/bin" 2>/dev/null || true
 
         # Remove Python stdlib we don't need
         rm -rf lib/python3.12/test lib/python3.12/tkinter lib/python3.12/idlelib 2>/dev/null || true
         rm -rf lib/python3.12/turtledemo lib/python3.12/ensurepip 2>/dev/null || true
-        # Keep include/ — Triton JIT-compiles C launcher stubs at runtime
-        # and needs Python.h headers.
+        # Keep include/ — Triton JIT needs Python.h headers
 
         # Ensure bundled clang is executable (permissions lost during tar)
-        chmod +x $SP/_rocm_sdk_core/lib/llvm/bin/clang* 2>/dev/null || true
+        chmod +x "$LLVM/bin/clang"* 2>/dev/null || true
 
         # NOTE: Do NOT strip .so files — AMD ROCm wheels use special ELF
         # alignment that strip corrupts, and numpy/scipy also break.
@@ -254,9 +273,7 @@ jobs:
         du -sh .
         echo ""
         echo "Top consumers:"
-        du -sh $SP/torch/ 2>/dev/null || true
-        du -sh $SP/vllm/ 2>/dev/null || true
-        du -sh $SP/_rocm_sdk_core/ 2>/dev/null || true
+        du -sh $SP/torch/ $SP/vllm/ $SP/_rocm_sdk_core/ $SP/aiter/ $SP/triton/ 2>/dev/null || true
 
     - name: Verify bundled environment works
       run: |
