@@ -5,7 +5,7 @@ on:
       gfx_target:
         description: 'AMD GPU targets (comma-separated)'
         required: false
-        default: 'gfx1151,gfx1150,gfx120X'
+        default: 'gfx110X,gfx1151,gfx1150,gfx120X'
       create_release:
         description: 'Create a GitHub release after successful build'
         required: false
@@ -19,7 +19,7 @@ on:
     - cron: '0 15 * * 0'
 
 env:
-  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X' }}
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
 
 jobs:
   prepare-matrix:
@@ -75,6 +75,7 @@ jobs:
         # Map targets to AMD wheel URL suffixes
         # See: https://rocm.docs.amd.com/en/latest/rocm-for-ai/vllm.html
         case "$target" in
+          gfx110X) suffix="gfx110X-all" ;;
           gfx1151) suffix="gfx1151" ;;
           gfx1150) suffix="gfx1150" ;;
           gfx120X) suffix="gfx120X-all" ;;
