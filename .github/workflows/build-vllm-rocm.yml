@@ -390,15 +390,33 @@ jobs:
 
         if [ "$size_mb" -gt "$MAX_SIZE" ]; then
           echo "Splitting into ${MAX_SIZE}MB parts..."
-          split -b ${MAX_SIZE}M -d --additional-suffix=.tar.gz \
+          # 1-based, 2-digit numeric suffixes -> {base}.part01.tar.gz, ...
+          split -b ${MAX_SIZE}M --numeric-suffixes=1 -a 2 \
+            --additional-suffix=.tar.gz \
             "${base}.tar.gz" "${base}.part"
           rm "${base}.tar.gz"
+
+          # Rename to HF-style partNN-of-MM.tar.gz, and emit a tiny manifest
+          # ({base}.partcount, one line with MM) so consumers can determine
+          # MM with a single HTTP GET instead of querying the GitHub Releases
+          # API (which is rate-limited to 60 req/hr per IP unauthenticated).
+          parts=( "${base}".part*.tar.gz )
+          total=${#parts[@]}
+          total_padded=$(printf "%02d" "$total")
+          for f in "${parts[@]}"; do
+            nn="${f##*.part}"; nn="${nn%%.tar.gz}"
+            mv "$f" "${base}.part${nn}-of-${total_padded}.tar.gz"
+          done
+          echo "$total" > "${base}.partcount"
+
           echo "Parts created:"
-          ls -la ${base}.part*
+          ls -la "${base}".part*
+          echo "Manifest:"
+          cat "${base}.partcount"
         fi
 
         echo "=== Release assets ==="
-        ls -la *.tar.gz 2>/dev/null || echo "No archives"
+        ls -la *.tar.gz *.partcount 2>/dev/null || echo "No archives"
 
     - name: Create Release
       env:
@@ -409,7 +427,7 @@ jobs:
         TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
         TARGET="${{ matrix.gfx_target }}"
 
-        upload_files=$(ls -1 *.tar.gz 2>/dev/null | tr '\n' ' ')
+        upload_files=$(ls -1 *.tar.gz *.partcount 2>/dev/null | tr '\n' ' ')
         echo "Files to upload: $upload_files"
 
         # Delete existing release with same tag (idempotent rebuilds)
