@@ -298,6 +298,26 @@ jobs:
         bash -n /opt/vllm/bin/vllm-server
         echo "All sanity checks passed"
 
+    # Tier 0 — static bundle qualification (report-only for now; does not gate
+    # the build). Emits a dashboard-friendly JSON fragment. This is the check
+    # that would have caught the vllm0.21.0 torch-ABI mismatch at build time.
+    - name: Tier 0 — static qualification
+      continue-on-error: true
+      run: |
+        python3 scripts/qualify/tier0_static.py \
+          --bundle-root /opt/vllm \
+          --gfx-target "${{ matrix.gfx_target }}" \
+          --output "tier0-${{ matrix.gfx_target }}.json"
+
+    - name: Upload Tier 0 report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: tier0-report-${{ matrix.gfx_target }}
+        path: tier0-${{ matrix.gfx_target }}.json
+        retention-days: 30
+        if-no-files-found: warn
+
     - name: Report final size
       run: |
         echo "=== Final artifact ==="
@@ -332,12 +352,38 @@ jobs:
       run: |
         [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
 
-  create-release:
-    needs: [prepare-matrix, build-ubuntu]
+  # ======================================================================
+  # Shared release metadata. build-ubuntu's outputs are identical across
+  # matrix legs (same vLLM/torch; only the gfx target differs), so reading
+  # them in a single job is reliable and avoids matrix-output ambiguity.
+  # ======================================================================
+  compute-meta:
+    needs: [build-ubuntu]
+    runs-on: ubuntu-22.04
+    if: always() && needs.build-ubuntu.result == 'success'
+    outputs:
+      vllm_version: ${{ needs.build-ubuntu.outputs.vllm_version }}
+      torch_version: ${{ needs.build-ubuntu.outputs.torch_version }}
+      rocm: ${{ steps.meta.outputs.rocm }}
+    steps:
+      - id: meta
+        run: |
+          TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
+          ROCM_VERSION=$(echo "$TORCH_VERSION" | grep -oP 'rocm[\d.]+' || echo "rocm")
+          echo "rocm=$ROCM_VERSION" >> "$GITHUB_OUTPUT"
+
+  # ======================================================================
+  # Publish each target as a PRERELEASE first. Qualification (below) then
+  # promotes to a full release only on pass. Failing builds stay prerelease:
+  # downloadable for debugging, but skipped by `gh ... /releases/latest`,
+  # which is how lemonade auto-discovers a release — so an unqualified build
+  # is never auto-picked.
+  # ======================================================================
+  publish-prerelease:
+    needs: [prepare-matrix, build-ubuntu, compute-meta]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-      pull-requests: write
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
@@ -348,97 +394,262 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
        github.event_name == 'schedule')
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Download build artifact for ${{ matrix.gfx_target }}
+        uses: actions/download-artifact@v4
+        with:
+          name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
+          path: ./artifact
 
-    - name: Download build artifact for ${{ matrix.gfx_target }}
-      uses: actions/download-artifact@v4
-      with:
-        name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: ./artifact
+      - name: Package + create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-${{ matrix.gfx_target }}"
+          MAX_SIZE=1900  # MB — GitHub limit is 2 GB per asset
+          base="${TAG}-x64"
 
-    - name: Generate release tag
-      id: generate-tag
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
-        TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
-        TARGET="${{ matrix.gfx_target }}"
+          echo "Creating: ${base}.tar.gz"
+          tar -czf "${base}.tar.gz" -C ./artifact .
+          size_mb=$(du -m "${base}.tar.gz" | cut -f1)
+          echo "Archive size: ${size_mb} MB"
 
-        # Extract ROCm version from torch version string
-        ROCM_VERSION=$(echo "$TORCH_VERSION" | grep -oP 'rocm[\d.]+' || echo "rocm")
+          if [ "$size_mb" -gt "$MAX_SIZE" ]; then
+            echo "Splitting into ${MAX_SIZE}MB parts..."
+            split -b ${MAX_SIZE}M --numeric-suffixes=1 -a 2 \
+              --additional-suffix=.tar.gz \
+              "${base}.tar.gz" "${base}.part"
+            rm "${base}.tar.gz"
+            parts=( "${base}".part*.tar.gz )
+            total=${#parts[@]}
+            total_padded=$(printf "%02d" "$total")
+            for f in "${parts[@]}"; do
+              nn="${f##*.part}"; nn="${nn%%.tar.gz}"
+              mv "$f" "${base}.part${nn}-of-${total_padded}.tar.gz"
+            done
+            echo "$total" > "${base}.partcount"
+          fi
 
-        # Tag format: vllm{version}-{rocm_version}-{gfx_target}
-        # e.g. vllm0.19.0-rocm7.12.0-gfx1150
-        TAG="vllm${VLLM_VERSION}-${ROCM_VERSION}-${TARGET}"
-        echo "tag=${TAG}" >> $GITHUB_OUTPUT
-        echo "Generated release tag: ${TAG}"
+          upload_files=$(ls -1 *.tar.gz *.partcount 2>/dev/null | tr '\n' ' ')
+          echo "Files to upload: $upload_files"
 
-    - name: Create archive (split if >1.9 GB for GitHub release limit)
-      run: |
-        TAG="${{ steps.generate-tag.outputs.tag }}"
-        MAX_SIZE=1900  # MB — GitHub limit is 2 GB per asset
-        base="${TAG}-x64"
+          # Idempotent rebuild: drop any existing release/tag, recreate as prerelease.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" \
+            --prerelease \
+            --title "$TAG" \
+            --notes "**GPU Target**: ${{ matrix.gfx_target }}
+          **vLLM Version**: ${{ needs.compute-meta.outputs.vllm_version }}
+          **PyTorch Version**: ${{ needs.compute-meta.outputs.torch_version }}
+          **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          **Status**: prerelease — pending qualification.
 
-        echo "Creating: ${base}.tar.gz"
-        tar -czf "${base}.tar.gz" -C ./artifact .
-        size_mb=$(du -m "${base}.tar.gz" | cut -f1)
-        echo "Archive size: ${size_mb} MB"
+          Portable vLLM build for ${{ matrix.gfx_target }}." \
+            $upload_files
 
-        if [ "$size_mb" -gt "$MAX_SIZE" ]; then
-          echo "Splitting into ${MAX_SIZE}MB parts..."
-          # 1-based, 2-digit numeric suffixes -> {base}.part01.tar.gz, ...
-          split -b ${MAX_SIZE}M --numeric-suffixes=1 -a 2 \
-            --additional-suffix=.tar.gz \
-            "${base}.tar.gz" "${base}.part"
-          rm "${base}.tar.gz"
+  # ======================================================================
+  # Tier 1 + Tier 2 — hardware smoke + standalone inference on gfx1151.
+  # Steps are report-only; the aggregate job makes the gate decision from
+  # the emitted fragments, so every tier always runs and uploads.
+  # ======================================================================
+  hw-qualify:
+    needs: [build-ubuntu, compute-meta]
+    runs-on: [self-hosted, stx-halo, Linux]
+    if: |
+      always() &&
+      needs.build-ubuntu.result == 'success' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
+       github.event_name == 'schedule')
+    env:
+      CANDIDATE_TAG: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-gfx1151
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download gfx1151 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: vllm-ubuntu-rocm-gfx1151-x64
+          path: ./vllm-install
+      - name: Make bundle executable
+        run: |
+          chmod +x vllm-install/bin/vllm-server vllm-install/bin/python3* 2>/dev/null || true
+          chmod +x vllm-install/lib/python3*/site-packages/_rocm_sdk_core/lib/llvm/bin/clang* 2>/dev/null || true
+      - name: Tier 1 — hardware smoke
+        run: |
+          python3 scripts/qualify/tier1_smoke.py \
+            --bundle-root ./vllm-install --gfx-target gfx1151 \
+            --candidate-tag "$CANDIDATE_TAG" --output tier1-gfx1151.json
+      - name: Tier 2 — standalone inference
+        run: |
+          export HF_HOME="${HF_HOME:-$RUNNER_TEMP/hf-cache}"
+          python3 scripts/qualify/tier2_inference.py \
+            --bundle-root ./vllm-install --gfx-target gfx1151 \
+            --candidate-tag "$CANDIDATE_TAG" --logs-dir ./tier2-logs \
+            --output tier2-gfx1151.json
+      - name: Upload Tier 1 fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier1-report-gfx1151
+          path: tier1-gfx1151.json
+          if-no-files-found: warn
+      - name: Upload Tier 2 fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-report-gfx1151
+          path: tier2-gfx1151.json
+          if-no-files-found: warn
+      - name: Upload Tier 2 server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-logs-gfx1151
+          path: tier2-logs/
+          if-no-files-found: ignore
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -9 -f "vllm.entrypoints" 2>/dev/null || true
+          pkill -9 -f "resource_tracker" 2>/dev/null || true
 
-          # Rename to HF-style partNN-of-MM.tar.gz, and emit a tiny manifest
-          # ({base}.partcount, one line with MM) so consumers can determine
-          # MM with a single HTTP GET instead of querying the GitHub Releases
-          # API (which is rate-limited to 60 req/hr per IP unauthenticated).
-          parts=( "${base}".part*.tar.gz )
-          total=${#parts[@]}
-          total_padded=$(printf "%02d" "$total")
-          for f in "${parts[@]}"; do
-            nn="${f##*.part}"; nn="${nn%%.tar.gz}"
-            mv "$f" "${base}.part${nn}-of-${total_padded}.tar.gz"
+  # ======================================================================
+  # Tier 3 — lemonade integration. Defined as a reusable workflow in the
+  # lemonade repo (single source of truth) and invoked here. It installs the
+  # candidate prerelease through lemonade and runs validate_vllm.py.
+  # NOTE: until the reusable workflow merges to lemonade's main, point the
+  #       ref below at the lemonade branch that carries it.
+  # ======================================================================
+  tier3:
+    needs: [compute-meta, publish-prerelease, hw-qualify]
+    if: |
+      always() &&
+      needs.publish-prerelease.result == 'success' &&
+      needs.hw-qualify.result == 'success'
+    uses: lemonade-sdk/lemonade/.github/workflows/validate-vllm-reusable.yml@feat/vllm-qualification-reusable
+    with:
+      candidate_tag: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-gfx1151
+      lite: ${{ github.event_name == 'pull_request' }}
+    secrets: inherit
+
+  # ======================================================================
+  # Aggregate per target: merge fragments → qualification record, decide
+  # promotion (per-target gating), and promote prerelease → release on pass.
+  # ======================================================================
+  aggregate:
+    needs: [prepare-matrix, compute-meta, build-ubuntu, publish-prerelease, hw-qualify, tier3]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
+      fail-fast: false
+    if: |
+      always() &&
+      needs.build-ubuntu.result == 'success' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
+       github.event_name == 'schedule')
+    env:
+      TARGET: ${{ matrix.gfx_target }}
+      CANDIDATE_TAG: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-${{ matrix.gfx_target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./all-artifacts
+      - name: Assemble fragments
+        run: |
+          mkdir -p frags
+          cp "all-artifacts/tier0-report-${TARGET}/tier0-${TARGET}.json" frags/ 2>/dev/null || true
+          if [ "$TARGET" = "gfx1151" ]; then
+            cp "all-artifacts/tier1-report-gfx1151/tier1-gfx1151.json" frags/ 2>/dev/null || true
+            cp "all-artifacts/tier2-report-gfx1151/tier2-gfx1151.json" frags/ 2>/dev/null || true
+            VJSON=$(find all-artifacts -name 'vllm_validation_rocm.json' | head -1 || true)
+            if [ -n "$VJSON" ]; then
+              python3 scripts/qualify/tier3_from_validate.py \
+                --validate-json "$VJSON" --gfx-target gfx1151 \
+                --candidate-tag "$CANDIDATE_TAG" \
+                --vllm-version "${{ needs.compute-meta.outputs.vllm_version }}" \
+                --torch-version "${{ needs.compute-meta.outputs.torch_version }}" \
+                --rocm-version "${{ needs.compute-meta.outputs.rocm }}" \
+                --output frags/tier3-gfx1151.json
+            fi
+          fi
+          echo "Fragments:"; ls -la frags/
+      - name: Aggregate + decide promotion
+        id: agg
+        run: |
+          if [ "$TARGET" = "gfx1151" ]; then
+            REQUIRE="tier0,tier1,tier2,tier3"; HW="--hardware-validated"
+          else
+            REQUIRE="tier0"; HW=""
+          fi
+          python3 scripts/qualify/aggregate.py \
+            --fragments-dir frags --gfx-target "$TARGET" \
+            --candidate-tag "$CANDIDATE_TAG" --require-tiers "$REQUIRE" $HW \
+            --output "qualification-${TARGET}.json"
+      - name: Promote prerelease → release (on pass)
+        if: steps.agg.outputs.promote == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "Promoting ${CANDIDATE_TAG} to a full release"
+          gh release edit "$CANDIDATE_TAG" --prerelease=false --latest
+      - name: Upload qualification record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-record-${{ matrix.gfx_target }}
+          path: qualification-${{ matrix.gfx_target }}.json
+          if-no-files-found: warn
+
+  # ======================================================================
+  # Append every qualification record to the durable JSONL ledger on the
+  # orphan `build-results` branch (single job to avoid concurrent-push
+  # races). This branch is the dashboard's data source.
+  # ======================================================================
+  ledger:
+    needs: [aggregate]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download qualification records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: qualification-record-*
+          path: ./records
+          merge-multiple: true
+      - name: Append to ledger on build-results branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin build-results >/dev/null 2>&1; then
+            git fetch origin build-results
+            git checkout build-results
+          else
+            git checkout --orphan build-results
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p results
+          touch results/ledger.jsonl
+          shopt -s nullglob
+          for rec in records/qualification-*.json; do
+            python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(',',':')))" "$rec" >> results/ledger.jsonl
           done
-          echo "$total" > "${base}.partcount"
-
-          echo "Parts created:"
-          ls -la "${base}".part*
-          echo "Manifest:"
-          cat "${base}.partcount"
-        fi
-
-        echo "=== Release assets ==="
-        ls -la *.tar.gz *.partcount 2>/dev/null || echo "No archives"
-
-    - name: Create Release
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        TAG="${{ steps.generate-tag.outputs.tag }}"
-        VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
-        TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
-        TARGET="${{ matrix.gfx_target }}"
-
-        upload_files=$(ls -1 *.tar.gz *.partcount 2>/dev/null | tr '\n' ' ')
-        echo "Files to upload: $upload_files"
-
-        # Delete existing release with same tag (idempotent rebuilds)
-        gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-
-        gh release create "$TAG" \
-          --title "$TAG" \
-          --notes "**GPU Target**: $TARGET
-        **vLLM Version**: $VLLM_VERSION
-        **PyTorch Version**: $TORCH_VERSION
-        **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-        Portable vLLM build for $TARGET. Includes bundled Python, PyTorch ROCm, and ROCm runtime. No separate installation required." \
-          $upload_files
+          git add results/ledger.jsonl
+          git commit -m "qualification ledger: run ${{ github.run_id }}" || { echo "nothing to commit"; exit 0; }
+          git push origin build-results
