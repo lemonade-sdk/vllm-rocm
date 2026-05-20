@@ -57,6 +57,7 @@ def now_iso():
 
 def build_meta(
     gfx_target,
+    channel=None,
     vllm_version=None,
     torch_version=None,
     rocm_version=None,
@@ -68,13 +69,15 @@ def build_meta(
 ):
     """Assemble the per-build metadata block shared by every fragment."""
     build_id = run_id or "local"
-    if gfx_target:
-        build_id = f"{build_id}-{gfx_target}"
+    for part in (gfx_target, channel):
+        if part:
+            build_id = f"{build_id}-{part}"
     return {
         "build_id": build_id,
         "run_id": run_id,
         "run_attempt": run_attempt,
         "gfx_target": gfx_target,
+        "channel": channel,
         "vllm_version": vllm_version,
         "torch_version": torch_version,
         "rocm_version": rocm_version,

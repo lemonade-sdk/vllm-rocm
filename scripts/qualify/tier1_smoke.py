@@ -168,6 +168,7 @@ def main():
     parser = argparse.ArgumentParser(description="Tier 1 hardware smoke test")
     parser.add_argument("--bundle-root", required=True)
     parser.add_argument("--gfx-target", required=True)
+    parser.add_argument("--channel", default=None, choices=[None, "stable", "nightly"])
     parser.add_argument("--candidate-tag", default=None)
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
     parser.add_argument("--run-attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT"))
@@ -180,6 +181,7 @@ def main():
 
     meta = report.build_meta(
         gfx_target=args.gfx_target,
+        channel=args.channel,
         vllm_version=vllm_v,
         torch_version=torch_v,
         rocm_version=rocm_v,

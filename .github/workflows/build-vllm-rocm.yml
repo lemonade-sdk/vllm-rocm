@@ -2,6 +2,12 @@ name: Build vLLM + ROCm
 on:
   workflow_dispatch:
     inputs:
+      channel:
+        description: 'Build channel: stable (AMD matched set) or nightly (latest vLLM+ROCm)'
+        required: false
+        default: 'nightly'
+        type: choice
+        options: [nightly, stable]
       gfx_target:
         description: 'AMD GPU targets (comma-separated)'
         required: false
@@ -16,10 +22,16 @@ on:
     types: [opened, synchronize, reopened]
 
   schedule:
+    # Weekly nightly build (latest vLLM + ROCm). Stable is triggered on AMD
+    # release (or manual dispatch with channel=stable) — see CLAUDE.md.
     - cron: '0 15 * * 0'
 
 env:
   GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
+  # Channel is a run-level parameter (not a matrix axis): stable and nightly
+  # have different triggers and different upstream sources, so they run as
+  # separate workflow runs. Scheduled runs default to nightly.
+  CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
 
 jobs:
   prepare-matrix:
@@ -96,70 +108,52 @@ jobs:
         /opt/vllm/bin/python3 -m pip install --upgrade pip
         echo "Python: $(/opt/vllm/bin/python3 --version)"
 
-    - name: Install PyTorch ROCm from AMD
+    - name: Install vLLM + PyTorch (channel=${{ env.CHANNEL }})
       run: |
-        echo "Installing PyTorch from AMD ROCm wheel index..."
-        /opt/vllm/bin/pip install \
-          --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
-          torch torchvision
-        /opt/vllm/bin/python3 -c "
-        import torch
-        print(f'PyTorch {torch.__version__}')
-        print(f'ROCm built-in: {torch.version.hip is not None}')
-        "
-
-    - name: Install vLLM ROCm (official wheel with ROCm native extensions)
-      run: |
-        echo "Installing vLLM from official ROCm wheel index..."
-        /opt/vllm/bin/pip install \
-          --extra-index-url https://wheels.vllm.ai/rocm/ \
-          vllm
-        echo "vLLM installed (import check deferred until after torch reinstall)"
-
-    - name: Reinstall AMD PyTorch ROCm (compatible with pip ROCm SDK)
-      run: |
-        # vLLM's prebuilt native extensions (_C.abi3.so / _rocm_C.abi3.so) are
-        # linked against the exact torch RELEASE the wheel was built with. We
-        # swap in AMD's ROCm torch (for the bundled ROCm SDK libs/amdsmi), but
-        # it MUST be the same release vLLM pinned. Installing a newer torch
-        # (e.g. 2.11, whose C++ ABI renamed c10::hip::* -> c10::cuda::*) yields
-        # "undefined symbol" load failures — the exact break that shipped in
-        # vllm0.21.0-rocm7.13.0. Tier 0 of the qualification suite guards this.
-        REQ_TORCH=$(/opt/vllm/bin/python3 -c "
-        import glob, re
-        for meta in glob.glob('/opt/vllm/lib/python3.12/site-packages/vllm-*.dist-info/METADATA'):
-            for line in open(meta, encoding='utf-8', errors='replace'):
-                if line.startswith('Requires-Dist:') and 'torch' in line:
-                    m = re.search(r'torch\s*==\s*([0-9]+(?:\.[0-9]+)*)', line)
-                    if m:
-                        print(m.group(1)); raise SystemExit
-        ")
-        if [ -n "$REQ_TORCH" ]; then
-          PIN="torch==${REQ_TORCH}"
-        else
-          echo "WARNING: could not determine vLLM's torch pin; falling back to latest"
-          PIN="torch"
-        fi
-        echo "Reinstalling AMD torch ($PIN) to match bundled ROCm SDK libraries..."
-        /opt/vllm/bin/pip install --force-reinstall --no-deps \
-          --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
-          "$PIN"
-
-        # Remove the vLLM-bundled amdsmi (v26.2.2 from ROCm 7.2.1) —
-        # it conflicts with the AMD pip ROCm SDK amdsmi (v26.3.0).
-        # The ROCm SDK version in _rocm_sdk_core/share/amd_smi/ is used instead.
         SP="/opt/vllm/lib/python3.12/site-packages"
+        TORCH_INDEX="${{ steps.wheel-urls.outputs.torch_index }}"
+        VLLM_INDEX="${{ steps.wheel-urls.outputs.vllm_index }}"
+
+        if [ "$CHANNEL" = "stable" ]; then
+          # STABLE: repackage AMD's own matched set. AMD's vLLM wheel declares
+          # its AMD PyTorch dependency, so resolving everything from AMD indexes
+          # yields a self-consistent set — no reinstall, no version pinning, no
+          # ABI reconciliation. Pure repackage of what AMD published.
+          echo "stable: installing AMD vLLM + matched AMD PyTorch"
+          /opt/vllm/bin/pip install \
+            --index-url "$VLLM_INDEX" \
+            --extra-index-url "$TORCH_INDEX" \
+            vllm torchvision
+        else
+          # NIGHTLY: latest vLLM (vLLM project) on the latest AMD ROCm PyTorch.
+          # We deliberately compose newest + newest. If they are ABI-incompatible
+          # (e.g. vllm0.21.0 wants c10::hip while the latest AMD torch exposes
+          # c10::cuda) we do NOT pin around it — the qualification suite reports
+          # nightly red and it stays a prerelease.
+          echo "nightly: installing latest AMD PyTorch + latest vLLM (vllm.ai)"
+          /opt/vllm/bin/pip install --index-url "$TORCH_INDEX" torch torchvision
+          /opt/vllm/bin/pip install --extra-index-url https://wheels.vllm.ai/rocm/ vllm
+          # vLLM pulled its own torch as a dependency; restore AMD's latest ROCm
+          # torch (for the bundled ROCm SDK libs / amdsmi). No version pin.
+          /opt/vllm/bin/pip install --force-reinstall --no-deps \
+            --index-url "$TORCH_INDEX" torch
+        fi
+
+        # Use the AMD pip ROCm SDK amdsmi (_rocm_sdk_core/share/amd_smi) rather
+        # than any amdsmi the wheels bundled.
         rm -rf $SP/amdsmi $SP/amdsmi-*.dist-info
 
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
+        # Report versions but DO NOT fail the build on a bad combination — a
+        # broken bundle must still be packaged and published (as prerelease) so
+        # the qualification suite can detect and REPORT it. Fixing is never our job.
         /opt/vllm/bin/python3 -c "
         import torch; print(f'PyTorch {torch.__version__}')
         import vllm; print(f'vLLM {vllm.__version__}')
-        print('Both imports OK')
-        "
+        " || echo "WARNING: import check failed — qualification will report this"
 
     - name: Pre-compile Triton HIP utilities (eliminates gcc dependency)
       run: |
@@ -333,6 +327,7 @@ jobs:
         python3 scripts/qualify/tier0_static.py \
           --bundle-root /opt/vllm \
           --gfx-target "${{ matrix.gfx_target }}" \
+          --channel "${{ env.CHANNEL }}" \
           --output "tier0-${{ matrix.gfx_target }}.json"
 
     - name: Upload Tier 0 report
@@ -432,7 +427,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-${{ matrix.gfx_target }}"
+          TAG="vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-${{ matrix.gfx_target }}-${{ env.CHANNEL }}"
           MAX_SIZE=1900  # MB — GitHub limit is 2 GB per asset
           base="${TAG}-x64"
 
@@ -466,12 +461,13 @@ jobs:
             --prerelease \
             --title "$TAG" \
             --notes "**GPU Target**: ${{ matrix.gfx_target }}
+          **Channel**: ${{ env.CHANNEL }}
           **vLLM Version**: ${{ needs.compute-meta.outputs.vllm_version }}
           **PyTorch Version**: ${{ needs.compute-meta.outputs.torch_version }}
           **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           **Status**: prerelease — pending qualification.
 
-          Portable vLLM build for ${{ matrix.gfx_target }}." \
+          Portable vLLM build for ${{ matrix.gfx_target }} (${{ env.CHANNEL }})." \
             $upload_files
 
   # ======================================================================
@@ -490,7 +486,7 @@ jobs:
        (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
        github.event_name == 'schedule')
     env:
-      CANDIDATE_TAG: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-gfx1151
+      CANDIDATE_TAG: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-gfx1151-${{ env.CHANNEL }}
     steps:
       - uses: actions/checkout@v4
       - name: Download gfx1151 bundle
@@ -506,12 +502,14 @@ jobs:
         run: |
           python3 scripts/qualify/tier1_smoke.py \
             --bundle-root ./vllm-install --gfx-target gfx1151 \
+            --channel "${{ env.CHANNEL }}" \
             --candidate-tag "$CANDIDATE_TAG" --output tier1-gfx1151.json
       - name: Tier 2 — standalone inference
         run: |
           export HF_HOME="${HF_HOME:-$RUNNER_TEMP/hf-cache}"
           python3 scripts/qualify/tier2_inference.py \
             --bundle-root ./vllm-install --gfx-target gfx1151 \
+            --channel "${{ env.CHANNEL }}" \
             --candidate-tag "$CANDIDATE_TAG" --logs-dir ./tier2-logs \
             --output tier2-gfx1151.json
       - name: Upload Tier 1 fragment
@@ -558,7 +556,7 @@ jobs:
       needs.hw-qualify.result == 'success'
     uses: lemonade-sdk/lemonade/.github/workflows/validate-vllm-reusable.yml@feat/vllm-qualification-reusable
     with:
-      candidate_tag: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-gfx1151
+      candidate_tag: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-gfx1151-${{ env.CHANNEL }}
       lite: ${{ github.event_name == 'pull_request' }}
     secrets: inherit
 
@@ -583,7 +581,7 @@ jobs:
        github.event_name == 'schedule')
     env:
       TARGET: ${{ matrix.gfx_target }}
-      CANDIDATE_TAG: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-${{ matrix.gfx_target }}
+      CANDIDATE_TAG: vllm${{ needs.compute-meta.outputs.vllm_version }}-${{ needs.compute-meta.outputs.rocm }}-${{ matrix.gfx_target }}-${{ env.CHANNEL }}
     steps:
       - uses: actions/checkout@v4
       - name: Download all run artifacts
@@ -601,6 +599,7 @@ jobs:
             if [ -n "$VJSON" ]; then
               python3 scripts/qualify/tier3_from_validate.py \
                 --validate-json "$VJSON" --gfx-target gfx1151 \
+                --channel "${{ env.CHANNEL }}" \
                 --candidate-tag "$CANDIDATE_TAG" \
                 --vllm-version "${{ needs.compute-meta.outputs.vllm_version }}" \
                 --torch-version "${{ needs.compute-meta.outputs.torch_version }}" \
@@ -619,6 +618,7 @@ jobs:
           fi
           python3 scripts/qualify/aggregate.py \
             --fragments-dir frags --gfx-target "$TARGET" \
+            --channel "${{ env.CHANNEL }}" \
             --candidate-tag "$CANDIDATE_TAG" --require-tiers "$REQUIRE" $HW \
             --output "qualification-${TARGET}.json"
       - name: Promote prerelease → release (on pass)
@@ -627,8 +627,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          # Do NOT use --latest: it is a single repo-wide pointer that cannot
+          # represent two channels. Consumers select a channel by tag suffix
+          # (…-stable / …-nightly), not GitHub's "latest" release.
           echo "Promoting ${CANDIDATE_TAG} to a full release"
-          gh release edit "$CANDIDATE_TAG" --prerelease=false --latest
+          gh release edit "$CANDIDATE_TAG" --prerelease=false
       - name: Upload qualification record
         if: always()
         uses: actions/upload-artifact@v4

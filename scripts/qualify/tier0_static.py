@@ -329,6 +329,7 @@ def main():
         help="Root of the assembled bundle (contains lib/python3*/site-packages)",
     )
     parser.add_argument("--gfx-target", required=True)
+    parser.add_argument("--channel", default=None, choices=[None, "stable", "nightly"])
     parser.add_argument("--candidate-tag", default=None)
     parser.add_argument("--lemonade-ref", default=None)
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
@@ -349,6 +350,7 @@ def main():
     torch_version = dist_info_version(sp, "torch")
     meta = report.build_meta(
         gfx_target=args.gfx_target,
+        channel=args.channel,
         vllm_version=dist_info_version(sp, "vllm"),
         torch_version=torch_version,
         rocm_version=rocm_from_torch(torch_version),

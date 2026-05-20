@@ -59,7 +59,7 @@ def write_step_summary(record, promote, reasons):
     lines = [
         f"## Qualification — {meta.get('candidate_tag') or meta.get('gfx_target')}",
         "",
-        f"- **Target:** `{meta.get('gfx_target')}`",
+        f"- **Target:** `{meta.get('gfx_target')}`  **Channel:** `{meta.get('channel')}`",
         f"- **vLLM:** `{meta.get('vllm_version')}`  **torch:** `{meta.get('torch_version')}`",
         f"- **Overall:** **{record['overall'].upper()}**  "
         f"**Promote:** **{'YES' if promote else 'NO'}**",
@@ -106,6 +106,7 @@ def main():
     parser = argparse.ArgumentParser(description="Aggregate tier fragments")
     parser.add_argument("--fragments-dir", required=True)
     parser.add_argument("--gfx-target", required=True)
+    parser.add_argument("--channel", default=None, choices=[None, "stable", "nightly"])
     parser.add_argument("--candidate-tag", default=None)
     parser.add_argument(
         "--require-tiers",
@@ -131,6 +132,7 @@ def main():
     fragments = load_fragments(args.fragments_dir)
     extra = {
         "gfx_target": args.gfx_target,
+        "channel": args.channel,
         "candidate_tag": args.candidate_tag,
         "hardware_validated": bool(args.hardware_validated),
     }

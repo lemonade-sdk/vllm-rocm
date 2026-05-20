@@ -231,6 +231,7 @@ def main():
     parser = argparse.ArgumentParser(description="Tier 2 functional inference")
     parser.add_argument("--bundle-root", required=True)
     parser.add_argument("--gfx-target", required=True)
+    parser.add_argument("--channel", default=None, choices=[None, "stable", "nightly"])
     # Small *instruct* model: supports /v1/chat/completions (has a chat
     # template) as well as /v1/completions, so every endpoint check is valid.
     # A base model like facebook/opt-125m 400s on the chat endpoint.
@@ -249,6 +250,7 @@ def main():
     vllm_v, torch_v, rocm_v = detect_versions(root)
     meta = report.build_meta(
         gfx_target=args.gfx_target,
+        channel=args.channel,
         vllm_version=vllm_v,
         torch_version=torch_v,
         rocm_version=rocm_v,

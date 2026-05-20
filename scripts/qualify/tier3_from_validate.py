@@ -33,6 +33,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build a Tier 3 fragment")
     parser.add_argument("--validate-json", required=True)
     parser.add_argument("--gfx-target", required=True)
+    parser.add_argument("--channel", default=None, choices=[None, "stable", "nightly"])
     parser.add_argument("--candidate-tag", default=None)
     parser.add_argument("--vllm-version", default=None)
     parser.add_argument("--torch-version", default=None)
@@ -45,6 +46,7 @@ def main():
 
     meta = report.build_meta(
         gfx_target=args.gfx_target,
+        channel=args.channel,
         vllm_version=args.vllm_version,
         torch_version=args.torch_version,
         rocm_version=args.rocm_version,
