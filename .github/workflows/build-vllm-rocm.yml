@@ -118,10 +118,32 @@ jobs:
 
     - name: Reinstall AMD PyTorch ROCm (compatible with pip ROCm SDK)
       run: |
-        echo "Reinstalling AMD torch to match bundled ROCm SDK libraries..."
+        # vLLM's prebuilt native extensions (_C.abi3.so / _rocm_C.abi3.so) are
+        # linked against the exact torch RELEASE the wheel was built with. We
+        # swap in AMD's ROCm torch (for the bundled ROCm SDK libs/amdsmi), but
+        # it MUST be the same release vLLM pinned. Installing a newer torch
+        # (e.g. 2.11, whose C++ ABI renamed c10::hip::* -> c10::cuda::*) yields
+        # "undefined symbol" load failures — the exact break that shipped in
+        # vllm0.21.0-rocm7.13.0. Tier 0 of the qualification suite guards this.
+        REQ_TORCH=$(/opt/vllm/bin/python3 -c "
+        import glob, re
+        for meta in glob.glob('/opt/vllm/lib/python3.12/site-packages/vllm-*.dist-info/METADATA'):
+            for line in open(meta, encoding='utf-8', errors='replace'):
+                if line.startswith('Requires-Dist:') and 'torch' in line:
+                    m = re.search(r'torch\s*==\s*([0-9]+(?:\.[0-9]+)*)', line)
+                    if m:
+                        print(m.group(1)); raise SystemExit
+        ")
+        if [ -n "$REQ_TORCH" ]; then
+          PIN="torch==${REQ_TORCH}"
+        else
+          echo "WARNING: could not determine vLLM's torch pin; falling back to latest"
+          PIN="torch"
+        fi
+        echo "Reinstalling AMD torch ($PIN) to match bundled ROCm SDK libraries..."
         /opt/vllm/bin/pip install --force-reinstall --no-deps \
           --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
-          torch
+          "$PIN"
 
         # Remove the vLLM-bundled amdsmi (v26.2.2 from ROCm 7.2.1) —
         # it conflicts with the AMD pip ROCm SDK amdsmi (v26.3.0).
@@ -245,15 +267,19 @@ jobs:
 
         # Trim LLVM toolchain: keep only clang + its libs (~350MB saved)
         LLVM="$SP/_rocm_sdk_core/lib/llvm"
-        # Keep only clang, clang-22, remove everything else from bin/
-        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-22" -delete 2>/dev/null || true
+        # Keep the clang driver and ITS versioned binary (clang-NN). The driver
+        # ("clang") execs "clang-<major>", and the LLVM major version tracks the
+        # ROCm release (22 -> 23 at ROCm 7.13). Hardcoding clang-22 deletes the
+        # real compiler on newer ROCm and breaks Triton's runtime JIT (no kernel
+        # can compile -> server fails to start). Match clang-* so it survives.
+        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-*" -delete 2>/dev/null || true
         find "$LLVM/bin" -type l ! -name "clang" -delete 2>/dev/null || true
         # Keep only libs that clang needs (libclang-cpp, libLLVM, rocm_sysdeps)
         find "$LLVM/lib" -name "*.so*" \
           ! -name "libclang-cpp*" \
           ! -name "libLLVM*" \
           -delete 2>/dev/null || true
-        rm -rf "$LLVM/lib/clang/22/include/cuda_wrappers" 2>/dev/null || true
+        rm -rf "$LLVM/lib/clang/"*/include/cuda_wrappers 2>/dev/null || true
 
         # Trim ROCm SDK bin/ (Python wrapper scripts, not needed)
         rm -rf "$SP/_rocm_sdk_core/bin" 2>/dev/null || true
