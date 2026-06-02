@@ -332,8 +332,114 @@ jobs:
       run: |
         [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
 
+  # GPU smoke test on the self-hosted dev_lab box (ta-devlab-halo-01).
+  # The [self-hosted, Linux, gfx1151] label set resolves to the dev_lab pool;
+  # gfx1151 is the only target whose kernels can actually run on this Strix Halo
+  # iGPU, so we use it as the gate for ALL releases (see create-release `needs`).
+  test-gfx1151:
+    needs: build-ubuntu
+    runs-on: [self-hosted, Linux, gfx1151]
+    # Only on release builds. Skips PRs, dispatches with create_release=false,
+    # and dispatches that didn't select gfx1151 (nothing to test → release ungated).
+    if: >-
+      github.event_name != 'pull_request' &&
+      (
+        github.event_name == 'schedule' ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) &&
+          contains(github.event.inputs.gfx_target, 'gfx1151')
+        )
+      )
+    steps:
+    - name: Download gfx1151 artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: vllm-ubuntu-rocm-gfx1151-x64
+        path: ${{ runner.temp }}/vllm-test/vllm
+
+    - name: Restore permissions and ROCm symlinks
+      run: |
+        # upload-artifact drops the +x bit and the unversioned .so symlinks the
+        # build created, so rebuild both before launching.
+        ROOT="${{ runner.temp }}/vllm-test/vllm"
+        SP="$ROOT/lib/python3.12/site-packages"
+        chmod +x "$ROOT/bin/"* 2>/dev/null || true
+        chmod +x "$SP/_rocm_sdk_core/lib/llvm/bin/"clang* 2>/dev/null || true
+        ROCM_LIB="$SP/_rocm_sdk_core/lib"
+        for lib in "$ROCM_LIB"/*.so.*; do
+          [ -e "$lib" ] || continue
+          name=$(basename "$lib"); link="$ROCM_LIB/${name%%.*}.so"
+          [ ! -e "$link" ] && ln -sf "$name" "$link"
+        done
+
+    - name: Launch vLLM server and smoke test
+      run: |
+        ROOT="${{ runner.temp }}/vllm-test/vllm"
+        WORK="${{ runner.temp }}/vllm-test"
+        MODEL="facebook/opt-125m"
+        PORT=8123
+
+        "$ROOT/bin/vllm-server" \
+          --model "$MODEL" \
+          --port "$PORT" \
+          --max-model-len 2048 \
+          --gpu-memory-utilization 0.5 \
+          --enforce-eager \
+          > "$WORK/server.log" 2>&1 &
+        echo $! > "$WORK/server.pid"
+
+        # Wait up to 5 min for the server to report healthy
+        ok=0
+        for i in $(seq 1 60); do
+          if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+            echo "Server healthy after ~$((i*5))s"; ok=1; break
+          fi
+          # Bail early if the server process already died
+          if ! kill -0 "$(cat "$WORK/server.pid")" 2>/dev/null; then
+            echo "::error::Server process exited during startup"; break
+          fi
+          sleep 5
+        done
+        if [ "$ok" != "1" ]; then
+          echo "::error::vLLM server did not become healthy"
+          tail -n 150 "$WORK/server.log" || true
+          exit 1
+        fi
+
+        # One real completion request through the OpenAI-compatible endpoint
+        resp=$(curl -fsS "http://127.0.0.1:$PORT/v1/completions" \
+          -H "Content-Type: application/json" \
+          -d "{\"model\":\"$MODEL\",\"prompt\":\"The capital of France is\",\"max_tokens\":16,\"temperature\":0}")
+        echo "Completion response: $resp"
+        echo "$resp" | grep -q '"text"' || { echo "::error::No completion text in response"; exit 1; }
+        echo "gfx1151 GPU smoke test passed"
+
+    - name: Upload server log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gfx1151-smoke-test-log
+        path: ${{ runner.temp }}/vllm-test/server.log
+        if-no-files-found: ignore
+
+    - name: Tear down server and clean up
+      if: always()
+      run: |
+        # Free the GPU on this persistent runner no matter how the test ended.
+        WORK="${{ runner.temp }}/vllm-test"
+        if [ -f "$WORK/server.pid" ]; then
+          pid=$(cat "$WORK/server.pid")
+          pkill -P "$pid" 2>/dev/null || true
+          kill "$pid" 2>/dev/null || true
+          sleep 5
+          kill -9 "$pid" 2>/dev/null || true
+        fi
+        pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+        rm -rf "$WORK" || true
+
   create-release:
-    needs: [prepare-matrix, build-ubuntu]
+    needs: [prepare-matrix, build-ubuntu, test-gfx1151]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -344,6 +450,7 @@ jobs:
     if: |
       always() &&
       needs.build-ubuntu.result == 'success' &&
+      (needs.test-gfx1151.result == 'success' || needs.test-gfx1151.result == 'skipped') &&
       github.event_name != 'pull_request' &&
       (github.event_name == 'workflow_dispatch' &&
        (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||

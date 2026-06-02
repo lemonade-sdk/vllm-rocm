@@ -87,7 +87,8 @@ Our GitHub Actions workflow:
 - Installs **PyTorch ROCm** from AMD's pip index (`https://repo.amd.com/rocm/whl/<target>/`)
 - Installs **vLLM ROCm** (pre-built wheel) from AMD's vLLM wheel index (`https://wheels.vllm.ai/rocm/`), which pulls the matching `rocm-sdk-core` and `rocm-sdk-libraries-gfx<target>` wheels as transitive deps
 - Generates a `bin/vllm-server` shim that wires up `LD_LIBRARY_PATH` / `PYTHONPATH` at startup
-- Tars the result, splits it into `< 2 GB` parts, and tests on self-hosted AMD GPU hardware before releasing
+- Smoke-tests the **gfx1151** build on self-hosted AMD GPU hardware (Strix Halo) — launching the server and running a completion — and gates all releases on it passing
+- Tars the result, splits it into `< 2 GB` parts, and publishes the release
 
 | GPU Target | Ubuntu |
 |------------|--------|
