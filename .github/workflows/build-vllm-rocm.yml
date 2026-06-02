@@ -353,10 +353,50 @@ jobs:
       )
     steps:
     - name: Download gfx1151 artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: vllm-ubuntu-rocm-gfx1151-x64
-        path: ${{ runner.temp }}/vllm-test/vllm
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        WORK="${{ runner.temp }}/vllm-test"
+        DEST="$WORK/vllm"
+        ZIP="$WORK/artifact.zip"
+        mkdir -p "$DEST"
+        echo "=== Disk before download ==="; df -h "$WORK" || true
+
+        # The build artifact is ~3.3 GB (extracts to ~7 GB). actions/download-artifact@v4
+        # is unreliable for artifacts this size on self-hosted runners — it failed
+        # here after its own 5 retries. Pull the artifact zip directly with curl
+        # (streams to disk, follows the blob redirect, resumable) and unzip it,
+        # which is far more robust for multi-GB artifacts.
+        ART_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                   --jq '.artifacts[] | select(.name=="vllm-ubuntu-rocm-gfx1151-x64") | .id')
+        [ -n "$ART_ID" ] || { echo "::error::gfx1151 artifact not found for this run"; exit 1; }
+        echo "Artifact id: $ART_ID"
+
+        ok=0
+        for attempt in 1 2 3; do
+          echo "=== curl attempt $attempt ==="
+          if curl -fL --retry 5 --retry-delay 10 --retry-all-errors -C - \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  -o "$ZIP" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip"; then
+            ok=1; break
+          fi
+          echo "attempt $attempt failed; retrying in 15s"; sleep 15
+        done
+        [ "$ok" = "1" ] || { echo "::error::artifact zip download failed after 3 attempts"; df -h "$WORK" || true; exit 1; }
+        echo "Downloaded zip: $(du -h "$ZIP" | cut -f1)"
+
+        echo "=== Extracting ==="
+        if command -v unzip >/dev/null 2>&1; then
+          unzip -q -o "$ZIP" -d "$DEST"
+        else
+          python3 -m zipfile -e "$ZIP" "$DEST"
+        fi
+        rm -f "$ZIP"   # reclaim space immediately
+        echo "Extracted $(du -sh "$DEST" | cut -f1) to $DEST"
+        echo "=== Disk after extract ==="; df -h "$WORK" || true
 
     - name: Restore permissions and ROCm symlinks
       run: |
