@@ -332,13 +332,16 @@ jobs:
       run: |
         [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
 
-  # GPU smoke test on the self-hosted dev_lab box (ta-devlab-halo-01).
-  # The [self-hosted, Linux, gfx1151] label set resolves to the dev_lab pool;
-  # gfx1151 is the only target whose kernels can actually run on this Strix Halo
-  # iGPU, so we use it as the gate for ALL releases (see create-release `needs`).
-  test-gfx1151:
+  # 15-test qualification on the self-hosted dev_lab box (ta-devlab-halo-02, 200 GB).
+  # Runs the scripts/qualify harness against the built bundle:
+  #   tier0 static (5) + tier1 hardware smoke (5) + tier2 functional inference (5)
+  # = 15 tests, then aggregates them into a qualification report and a promotion
+  # decision. Releases are gated on promotion (see create-release `needs`).
+  qualify:
     needs: build-ubuntu
-    runs-on: [self-hosted, Linux, gfx1151]
+    runs-on: [self-hosted, Linux, ta-devlab-halo-02]
+    env:
+      GFX: gfx1151
     # Only on release builds. Skips PRs, dispatches with create_release=false,
     # and dispatches that didn't select gfx1151 (nothing to test → release ungated).
     if: >-
@@ -352,22 +355,23 @@ jobs:
         )
       )
     steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
     - name: Download gfx1151 artifact
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-        WORK="${{ runner.temp }}/vllm-test"
+        WORK="${{ runner.temp }}/vllm-qual"
         DEST="$WORK/vllm"
         ZIP="$WORK/artifact.zip"
         mkdir -p "$DEST"
         echo "=== Disk before download ==="; df -h "$WORK" || true
 
-        # The build artifact is ~3.3 GB (extracts to ~7 GB). actions/download-artifact@v4
-        # is unreliable for artifacts this size on self-hosted runners — it failed
-        # here after its own 5 retries. Pull the artifact zip directly with curl
-        # (streams to disk, follows the blob redirect, resumable) and unzip it,
-        # which is far more robust for multi-GB artifacts.
+        # The build artifact is ~3.3 GB (extracts to ~11 GB). actions/download-artifact@v4
+        # is unreliable for artifacts this size on self-hosted runners, so pull the
+        # artifact zip directly with curl (streams to disk, resumable) and unzip it.
         # Resolve the artifact id via the REST API with curl + python3 — the box
         # does not have the gh CLI installed.
         ART_ID=$(curl -fsSL \
@@ -378,12 +382,10 @@ jobs:
         [ -n "$ART_ID" ] || { echo "::error::gfx1151 artifact not found for this run"; exit 1; }
         echo "Artifact id: $ART_ID"
 
-        # Fail fast with a clear message if the box lacks room for the ~11 GB
-        # extracted build (needs the 3.3 GB zip + 11 GB extracted ≈ 15 GB).
         avail_gb=$(df -BG --output=avail "$WORK" | tail -1 | tr -dc '0-9')
         echo "Available space: ${avail_gb} GB"
         if [ "${avail_gb:-0}" -lt 15 ]; then
-          echo "::error::Only ${avail_gb} GB free on the runner; need ~15 GB for the 11 GB build. Free disk on this runner."
+          echo "::error::Only ${avail_gb} GB free on the runner; need ~15 GB for the 11 GB build."
           exit 1
         fi
 
@@ -415,8 +417,8 @@ jobs:
     - name: Restore permissions and ROCm symlinks
       run: |
         # upload-artifact drops the +x bit and the unversioned .so symlinks the
-        # build created, so rebuild both before launching.
-        ROOT="${{ runner.temp }}/vllm-test/vllm"
+        # build created, so rebuild both before running the harness.
+        ROOT="${{ runner.temp }}/vllm-qual/vllm"
         SP="$ROOT/lib/python3.12/site-packages"
         chmod +x "$ROOT/bin/"* 2>/dev/null || true
         chmod +x "$SP/_rocm_sdk_core/lib/llvm/bin/"clang* 2>/dev/null || true
@@ -427,73 +429,63 @@ jobs:
           [ ! -e "$link" ] && ln -sf "$name" "$link"
         done
 
-    - name: Launch vLLM server and smoke test
+    - name: Run 15-test qualification (tier0 + tier1 + tier2)
+      id: qual
       run: |
-        ROOT="${{ runner.temp }}/vllm-test/vllm"
-        WORK="${{ runner.temp }}/vllm-test"
-        MODEL="facebook/opt-125m"
-        PORT=8123
+        WORK="${{ runner.temp }}/vllm-qual"
+        ROOT="$WORK/vllm"
+        PY="$ROOT/bin/python3"
+        FRAG="$WORK/fragments"; mkdir -p "$FRAG"
+        Q="$GITHUB_WORKSPACE/scripts/qualify"
+        TAG="vllm${{ needs.build-ubuntu.outputs.vllm_version }}-${GFX}"
 
-        "$ROOT/bin/vllm-server" \
-          --model "$MODEL" \
-          --port "$PORT" \
-          --max-model-len 2048 \
-          --gpu-memory-utilization 0.5 \
-          --enforce-eager \
-          > "$WORK/server.log" 2>&1 &
-        echo $! > "$WORK/server.pid"
+        # The tiers are run WITHOUT --fail-on-error so all 15 tests execute and
+        # emit a JSON fragment even when one fails; `aggregate --fail-on-no-promote`
+        # is the single gate that decides pass/fail for the whole job.
+        echo "::group::Tier 0 — static bundle verification (T0.1–T0.6)"
+        "$PY" "$Q/tier0_static.pyc"   --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel stable --candidate-tag "$TAG" --output "$FRAG/tier0-report.json" || true
+        echo "::endgroup::"
 
-        # Wait up to 5 min for the server to report healthy
-        ok=0
-        for i in $(seq 1 60); do
-          if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-            echo "Server healthy after ~$((i*5))s"; ok=1; break
-          fi
-          # Bail early if the server process already died
-          if ! kill -0 "$(cat "$WORK/server.pid")" 2>/dev/null; then
-            echo "::error::Server process exited during startup"; break
-          fi
-          sleep 5
-        done
-        if [ "$ok" != "1" ]; then
-          echo "::error::vLLM server did not become healthy"
-          tail -n 150 "$WORK/server.log" || true
-          exit 1
-        fi
+        echo "::group::Tier 1 — hardware smoke (T1.1–T1.5)"
+        "$PY" "$Q/tier1_smoke.pyc"    --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel stable --candidate-tag "$TAG" --output "$FRAG/tier1-report.json" || true
+        echo "::endgroup::"
 
-        # One real completion request through the OpenAI-compatible endpoint
-        resp=$(curl -fsS "http://127.0.0.1:$PORT/v1/completions" \
-          -H "Content-Type: application/json" \
-          -d "{\"model\":\"$MODEL\",\"prompt\":\"The capital of France is\",\"max_tokens\":16,\"temperature\":0}")
-        echo "Completion response: $resp"
-        echo "$resp" | grep -q '"text"' || { echo "::error::No completion text in response"; exit 1; }
-        echo "gfx1151 GPU smoke test passed"
+        echo "::group::Tier 2 — functional inference (T2.1–T2.5)"
+        "$PY" "$Q/tier2_inference.pyc" --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel stable --candidate-tag "$TAG" \
+            --model Qwen/Qwen2.5-0.5B-Instruct --logs-dir "$FRAG" \
+            --output "$FRAG/tier2-report.json" || true
+        echo "::endgroup::"
 
-    - name: Upload server log
+        echo "=== Aggregate fragments → qualification report (gates the job) ==="
+        "$PY" "$Q/aggregate.pyc" --fragments-dir "$FRAG" --gfx-target "$GFX" \
+            --channel stable --candidate-tag "$TAG" \
+            --require-tiers tier0,tier1,tier2 --hardware-validated \
+            --output "$FRAG/qualification-report.json" \
+            --fail-on-no-promote
+
+    - name: Upload qualification report and fragments
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: gfx1151-smoke-test-log
-        path: ${{ runner.temp }}/vllm-test/server.log
-        if-no-files-found: ignore
+        name: qualification-gfx1151
+        path: |
+          ${{ runner.temp }}/vllm-qual/fragments/*.json
+          ${{ runner.temp }}/vllm-qual/fragments/*.log
+        if-no-files-found: warn
 
-    - name: Tear down server and clean up
+    - name: Tear down and clean up
       if: always()
       run: |
-        # Free the GPU on this persistent runner no matter how the test ended.
-        WORK="${{ runner.temp }}/vllm-test"
-        if [ -f "$WORK/server.pid" ]; then
-          pid=$(cat "$WORK/server.pid")
-          pkill -P "$pid" 2>/dev/null || true
-          kill "$pid" 2>/dev/null || true
-          sleep 5
-          kill -9 "$pid" 2>/dev/null || true
-        fi
+        # Free the GPU on this persistent runner no matter how the harness ended.
+        WORK="${{ runner.temp }}/vllm-qual"
         pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
         rm -rf "$WORK" || true
 
   create-release:
-    needs: [prepare-matrix, build-ubuntu, test-gfx1151]
+    needs: [prepare-matrix, build-ubuntu, qualify]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -504,7 +496,7 @@ jobs:
     if: |
       always() &&
       needs.build-ubuntu.result == 'success' &&
-      (needs.test-gfx1151.result == 'success' || needs.test-gfx1151.result == 'skipped') &&
+      (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') &&
       github.event_name != 'pull_request' &&
       (github.event_name == 'workflow_dispatch' &&
        (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
