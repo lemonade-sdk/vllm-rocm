@@ -1,0 +1,280 @@
+{
+  "schema_version": 1,
+  "kind": "qualification_record",
+  "generated_at": "2026-06-06T08:00:32Z",
+  "build": {
+    "build_id": "27056544386-gfx1151-stable",
+    "run_id": "27056544386",
+    "run_attempt": "1",
+    "gfx_target": "gfx1151",
+    "channel": "stable",
+    "vllm_version": "0.22.1+rocm722",
+    "torch_version": "2.11.0+rocm7.13.0",
+    "rocm_version": "7.13.0",
+    "candidate_tag": "vllm0.22.1-gfx1151",
+    "lemonade_ref": null,
+    "hardware_validated": true
+  },
+  "overall": "fail",
+  "promoted": false,
+  "counts": {
+    "pass": 7,
+    "fail": 3,
+    "warn": 0,
+    "skip": 0,
+    "total": 10
+  },
+  "tiers": {
+    "tier0": {
+      "status": "fail",
+      "tier_name": "Static bundle verification",
+      "counts": {
+        "pass": 3,
+        "fail": 2,
+        "warn": 0,
+        "skip": 0,
+        "total": 5
+      },
+      "tests": [
+        {
+          "id": "T0.1",
+          "name": "torch version-pin consistency",
+          "tier": "tier0",
+          "status": "fail",
+          "gating": true,
+          "duration_ms": 0,
+          "error": "vLLM requires torch==2.10.0 but bundle ships 2.11.0",
+          "details": {
+            "vllm_requires_torch": "2.10.0+git8514f05",
+            "bundled_torch": "2.11.0+rocm7.13.0",
+            "required_release": "2.10.0",
+            "bundled_release": "2.11.0"
+          }
+        },
+        {
+          "id": "T0.2",
+          "name": "native-ext symbol satisfaction",
+          "tier": "tier0",
+          "status": "fail",
+          "gating": true,
+          "duration_ms": 181,
+          "error": "18 torch ABI symbol(s) unresolved, e.g. c10::MessageLogger::MessageLogger(char const*, int, int, bool)",
+          "details": {
+            "libs_searched": 42,
+            "torch_symbols_checked": 152,
+            "missing_count": 18,
+            "per_ext": {
+              "_C.abi3.so": {
+                "torch_symbols_checked": 90,
+                "missing": 10
+              },
+              "_rocm_C.abi3.so": {
+                "torch_symbols_checked": 62,
+                "missing": 8
+              }
+            },
+            "missing_symbols": [
+              {
+                "mangled": "_ZN3c1013MessageLoggerC1EPKciib",
+                "demangled": "c10::MessageLogger::MessageLogger(char const*, int, int, bool)"
+              },
+              {
+                "mangled": "_ZN3c103hip14current_deviceEv",
+                "demangled": "c10::hip::current_device()"
+              },
+              {
+                "mangled": "_ZN3c103hip17getStreamFromPoolEba",
+                "demangled": "c10::hip::getStreamFromPool(bool, signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip17getStreamFromPoolEia",
+                "demangled": "c10::hip::getStreamFromPool(int, signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip19getCurrentHIPStreamEa",
+                "demangled": "c10::hip::getCurrentHIPStream(signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip19getDefaultHIPStreamEa",
+                "demangled": "c10::hip::getDefaultHIPStream(signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip19setCurrentHIPStreamENS0_9HIPStreamE",
+                "demangled": "c10::hip::setCurrentHIPStream(c10::hip::HIPStream)"
+              },
+              {
+                "mangled": "_ZN3c103hip21warn_or_error_on_syncEv",
+                "demangled": "c10::hip::warn_or_error_on_sync()"
+              },
+              {
+                "mangled": "_ZN3c103hip28c10_hip_check_implementationEiPKcS2_jb",
+                "demangled": "c10::hip::c10_hip_check_implementation(int, char const*, char const*, unsigned int, bool)"
+              },
+              {
+                "mangled": "_ZNK3c103hip9HIPStream6streamEv",
+                "demangled": "c10::hip::HIPStream::stream() const"
+              },
+              {
+                "mangled": "_ZN3c103hip17getStreamFromPoolEba",
+                "demangled": "c10::hip::getStreamFromPool(bool, signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip17getStreamFromPoolEia",
+                "demangled": "c10::hip::getStreamFromPool(int, signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip19getCurrentHIPStreamEa",
+                "demangled": "c10::hip::getCurrentHIPStream(signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip19getDefaultHIPStreamEa",
+                "demangled": "c10::hip::getDefaultHIPStream(signed char)"
+              },
+              {
+                "mangled": "_ZN3c103hip19setCurrentHIPStreamENS0_9HIPStreamE",
+                "demangled": "c10::hip::setCurrentHIPStream(c10::hip::HIPStream)"
+              },
+              {
+                "mangled": "_ZN3c103hip21warn_or_error_on_syncEv",
+                "demangled": "c10::hip::warn_or_error_on_sync()"
+              },
+              {
+                "mangled": "_ZN3c103hip28c10_hip_check_implementationEiPKcS2_jb",
+                "demangled": "c10::hip::c10_hip_check_implementation(int, char const*, char const*, unsigned int, bool)"
+              },
+              {
+                "mangled": "_ZNK3c103hip9HIPStream6streamEv",
+                "demangled": "c10::hip::HIPStream::stream() const"
+              }
+            ]
+          }
+        },
+        {
+          "id": "T0.3",
+          "name": "DT_NEEDED resolution",
+          "tier": "tier0",
+          "status": "pass",
+          "gating": false,
+          "duration_ms": 3,
+          "error": null,
+          "details": {
+            "search_dirs": 5,
+            "unresolved": {}
+          }
+        },
+        {
+          "id": "T0.4",
+          "name": "structural manifest",
+          "tier": "tier0",
+          "status": "pass",
+          "gating": true,
+          "duration_ms": 2,
+          "error": null,
+          "details": {
+            "missing": [],
+            "warnings": []
+          }
+        },
+        {
+          "id": "T0.6",
+          "name": "amdsmi path sanity",
+          "tier": "tier0",
+          "status": "pass",
+          "gating": false,
+          "duration_ms": 0,
+          "error": null,
+          "details": {
+            "path": "/home/ubuntu/actions-runner/_work/_temp/vllm-qual/vllm/lib/python3.12/site-packages/_rocm_sdk_core/share/amd_smi",
+            "exists": true
+          }
+        }
+      ]
+    },
+    "tier1": {
+      "status": "fail",
+      "tier_name": "Hardware smoke",
+      "counts": {
+        "pass": 4,
+        "fail": 1,
+        "warn": 0,
+        "skip": 0,
+        "total": 5
+      },
+      "tests": [
+        {
+          "id": "T1.1",
+          "name": "native dlopen",
+          "tier": "tier1",
+          "status": "fail",
+          "gating": true,
+          "duration_ms": 2269,
+          "error": "native extension import failed (rc=1)",
+          "details": {
+            "stderr_tail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nImportError: /home/ubuntu/actions-runner/_work/_temp/vllm-qual/vllm/lib/python3.12/site-packages/vllm/_C.abi3.so: undefined symbol: _ZN3c103hip19getCurrentHIPStreamEa"
+          }
+        },
+        {
+          "id": "T1.2",
+          "name": "platform import",
+          "tier": "tier1",
+          "status": "pass",
+          "gating": true,
+          "duration_ms": 1617,
+          "error": null,
+          "details": {
+            "device_name": "AMD_Radeon_8060S"
+          }
+        },
+        {
+          "id": "T1.3",
+          "name": "device visibility",
+          "tier": "tier1",
+          "status": "pass",
+          "gating": true,
+          "duration_ms": 1067,
+          "error": null,
+          "details": {
+            "available": true,
+            "count": 1,
+            "name": "Radeon 8060S Graphics",
+            "gcnArchName": "gfx1151"
+          }
+        },
+        {
+          "id": "T1.4",
+          "name": "amdsmi gcn-arch",
+          "tier": "tier1",
+          "status": "pass",
+          "gating": false,
+          "duration_ms": 41,
+          "error": null,
+          "details": {
+            "target_graphics_version": "gfx1151"
+          }
+        },
+        {
+          "id": "T1.5",
+          "name": "launcher --help",
+          "tier": "tier1",
+          "status": "pass",
+          "gating": true,
+          "duration_ms": 7176,
+          "error": null,
+          "details": {}
+        }
+      ]
+    }
+  },
+  "promotion": {
+    "required_tiers": [
+      "tier0",
+      "tier1",
+      "tier2"
+    ],
+    "blocked_by": [
+      "tier0=fail",
+      "tier1=fail",
+      "tier2 missing"
+    ]
+  }
+}

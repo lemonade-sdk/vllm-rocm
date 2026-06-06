@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-06-06T08:00:32Z",
+  "builds": [
+    {
+      "build_id": "27056544386-gfx1151-stable",
+      "tag": "vllm0.22.1-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "stable",
+      "generated_at": "2026-06-06T08:00:32Z",
+      "run_id": "27056544386",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/27056544386",
+      "vllm_version": "0.22.1+rocm722",
+      "torch_version": "2.11.0+rocm7.13.0",
+      "rocm_version": "7.13.0",
+      "tests": {
+        "passed": 7,
+        "failed": 8,
+        "warned": 0,
+        "skipped": 0,
+        "total": 15
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier0=fail",
+        "tier1=fail",
+        "tier2 missing"
+      ],
+      "results": {
+        "T0.1": "fail",
+        "T0.2": "fail",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "fail",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "pass",
+        "T2.1": "missing",
+        "T2.2": "missing",
+        "T2.3": "missing",
+        "T2.4": "missing",
+        "T2.5": "missing"
+      },
+      "report_url": "reports/27056544386-gfx1151-stable.json"
+    }
+  ]
+}
