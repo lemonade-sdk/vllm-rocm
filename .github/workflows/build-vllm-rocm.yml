@@ -426,7 +426,10 @@ jobs:
         for lib in "$ROCM_LIB"/*.so.*; do
           [ -e "$lib" ] || continue
           name=$(basename "$lib"); link="$ROCM_LIB/${name%%.*}.so"
-          [ ! -e "$link" ] && ln -sf "$name" "$link"
+          # Use `if` (not `&&`) so a pre-existing symlink doesn't leave the loop
+          # with exit 1 and trip `set -e`. The artifact preserves these symlinks,
+          # so this is now mostly a defensive no-op.
+          if [ ! -e "$link" ]; then ln -sf "$name" "$link"; fi
         done
 
     - name: Run 15-test qualification (tier0 + tier1 + tier2)
