@@ -257,3 +257,100 @@ def merge_fragments(fragments, extra_meta=None):
         "counts": totals,
         "tiers": tiers,
     }
+
+
+# Signature rules for the deterministic "why blocked" summary. Each rule is
+# (predicate over the lowercased combined error text, title, recommended_action).
+# Ordered most-upstream-cause first so the title names the root, not a symptom.
+_SUMMARY_RULES = [
+    (
+        lambda s: "requires torch" in s
+        or "version-pin" in s
+        or ("torch" in s and "but bundle ships" in s),
+        "Blocked by torch version mismatch",
+        "Bundle a torch build matching the exact version vLLM was compiled "
+        "against (the matched ROCm release). Do not pin around the mismatch.",
+    ),
+    (
+        lambda s: "undefined symbol" in s or "abi symbol" in s or "c10::" in s,
+        "Blocked by torch ABI mismatch",
+        "Pair the vLLM wheel with the torch build its native extensions were "
+        "linked against (same ROCm version), or rebuild the extensions.",
+    ),
+    (
+        lambda s: "enginecore" in s
+        or "engine core" in s
+        or "failed to start" in s
+        or "importerror" in s,
+        "Blocked by vLLM server startup failure",
+        "Resolve the import/startup error (often a downstream torch ABI break) "
+        "so functional inference can run.",
+    ),
+]
+
+
+def build_summary(record):
+    """Deterministic 'why blocked' summary derived from the merged record.
+
+    Authoritative and stdlib-only — computed every run with no network. An
+    optional LLM step may later rewrite the prose (`title`, `recommended_action`,
+    `root_causes` wording) but must preserve `blocking_tests` and the verdict.
+    """
+    tiers = record.get("tiers", {})
+    blocked_by = record.get("promotion", {}).get("blocked_by", [])
+
+    failing = []
+    for tier in sorted(tiers):
+        for test in tiers[tier].get("tests", []):
+            if test.get("gating") and test.get("status") == STATUS_FAIL:
+                failing.append(test)
+    blocking_tests = [t["id"] for t in failing if t.get("id")]
+
+    if record.get("promoted"):
+        return {
+            "title": "Promoted — all required tiers passed",
+            "root_causes": [],
+            "recommended_action": "None — the build qualified and can be released.",
+            "blocking_tests": [],
+            "source": "deterministic",
+        }
+
+    root_causes, seen = [], set()
+    for test in failing:
+        err = (test.get("error") or "").strip()
+        if err and err not in seen:
+            seen.add(err)
+            root_causes.append(err)
+    # Required tiers that produced no fragment (e.g. server never booted).
+    for reason in blocked_by:
+        if reason.endswith("missing"):
+            tier = reason.split()[0]
+            root_causes.append(
+                f"{tier} ({TIER_NAMES.get(tier, tier)}) produced no results — "
+                "a prerequisite tier likely failed before it could run."
+            )
+
+    combined = " ".join((t.get("error") or "") for t in failing).lower()
+    title = action = None
+    for predicate, rule_title, rule_action in _SUMMARY_RULES:
+        if predicate(combined):
+            title, action = rule_title, rule_action
+            break
+    if title is None:
+        if blocking_tests:
+            title = f"Qualification failed ({len(blocking_tests)} gating check(s) failed)"
+            action = "Inspect the failing tests below and the attached run logs."
+        else:
+            title = "Qualification incomplete — required tier(s) did not run"
+            action = (
+                "A required tier produced no results; check whether an earlier "
+                "tier failed and prevented it from running."
+            )
+
+    return {
+        "title": title,
+        "root_causes": root_causes,
+        "recommended_action": action,
+        "blocking_tests": blocking_tests,
+        "source": "deterministic",
+    }

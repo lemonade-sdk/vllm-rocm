@@ -142,6 +142,9 @@ def main():
     promote, reasons = decide_promotion(record, require_tiers)
     record["promoted"] = promote
     record["promotion"] = {"required_tiers": require_tiers, "blocked_by": reasons}
+    # Deterministic, authoritative "why blocked" summary. An optional LLM pass
+    # (scripts/qualify/enrich_summary.py) may later rewrite only its prose.
+    record["summary"] = report.build_summary(record)
 
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(record, handle, indent=2)

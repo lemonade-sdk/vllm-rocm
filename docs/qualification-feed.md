@@ -78,6 +78,12 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
         "T1.1": "fail", "T1.2": "pass", "T1.3": "pass", "T1.4": "pass", "T1.5": "pass",
         "T2.1": "missing", "T2.2": "missing", "T2.3": "missing", "T2.4": "missing", "T2.5": "missing"
       },
+      "summary": {                             // compact "why blocked?" card
+        "title": "Blocked by torch version mismatch",
+        "recommended_action": "Bundle a torch build matching the version vLLM was compiled against...",
+        "blocking_tests": ["T0.1", "T0.2", "T1.1"],
+        "source": "deterministic"              // "deterministic" | "llm"
+      },
       "report_url": "reports/27054168201-gfx1151-stable.json"
     }
   ]
@@ -96,13 +102,23 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
 - **`qualified`** is the release gate (`true` only if every required tier passed).
 - **`report_url`** is relative to the feed base — open it for the full per-test
   detail (errors, unresolved symbols, timings).
+- **`summary`** is a ready-to-render "why blocked?" card: a one-line `title`, a
+  `recommended_action`, and `blocking_tests` (the gating tests that failed). It
+  lets the dashboard show *why* a build failed without parsing per-test errors.
+  The full `root_causes[]` list lives in the per-build report, not the index.
+  `source` is `"deterministic"` (rules-derived, always available) or `"llm"` (an
+  optional model pass polished the prose). **Machine-readable fields stay
+  authoritative regardless of `source`** — the LLM only rewrites wording, never
+  `blocking_tests`, `qualified`, or `results`. On a promoted build the card is a
+  short "all required tiers passed" note.
 
 ## `reports/<build_id>.json`
 
 The verbatim `qualification-report.json` from `scripts/qualify/aggregate`
 (`kind: "qualification_record"`): `build{}` metadata, `overall`, `promoted`,
-raw `counts`, and `tiers{}` with every test's `status` / `gating` / `error` /
-`details`. The drill-down source; immutable.
+raw `counts`, `tiers{}` with every test's `status` / `gating` / `error` /
+`details`, and the full `summary{}` (including `root_causes[]` and, when an LLM
+pass ran, `deterministic_fallback`). The drill-down source; immutable.
 
 ## `latest/<gfx_target>.json`
 

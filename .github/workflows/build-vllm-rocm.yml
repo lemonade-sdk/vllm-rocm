@@ -510,6 +510,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      # Optional. When set, the summary's prose is polished by an LLM pass;
+      # absent, the deterministic summary (written by aggregate) is published.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
     - name: Checkout repository (for the publish script + schema doc)
       uses: actions/checkout@v4
@@ -521,6 +525,20 @@ jobs:
       with:
         name: qualification-gfx1151
         path: report
+
+    - name: Enrich summary prose (optional, best-effort)
+      # Only when the key is configured. The deterministic summary is already
+      # in the report; this rewrites only its prose and never fails the job.
+      if: env.ANTHROPIC_API_KEY != ''
+      run: |
+        if [ ! -f report/qualification-report.json ]; then
+          echo "no report to enrich"; exit 0
+        fi
+        python3 -m pip install --quiet --disable-pip-version-check anthropic \
+          || { echo "::warning::pip install anthropic failed; skipping enrichment"; exit 0; }
+        python3 repo/scripts/qualify/enrich_summary.py \
+          --report report/qualification-report.json \
+          --model claude-haiku-4-5 || true
 
     - name: Publish to qualification-data branch
       env:
