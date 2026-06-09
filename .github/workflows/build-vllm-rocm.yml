@@ -22,7 +22,9 @@ on:
     types: [opened, synchronize, reopened]
 
   schedule:
-    - cron: '0 15 * * 0'
+    # Daily: poll for a new nightly. The detect-nightly job dedups against the
+    # qualification feed, so days with no new wheel cost only the cheap poll.
+    - cron: '0 15 * * *'
 
 env:
   GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
@@ -32,6 +34,54 @@ env:
   CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
 
 jobs:
+  # Decide whether AMD has published a nightly vLLM wheel we have not already
+  # qualified. Dedup key = the wheel's full version string, checked against the
+  # published qualification feed (which records every run, pass OR fail). This
+  # gates the pipeline so the daily cron only does real work when a genuinely
+  # new nightly appears. No-op (is_new=true) for PRs and the stable channel.
+  detect-nightly:
+    runs-on: ubuntu-22.04
+    outputs:
+      is_new: ${{ steps.detect.outputs.is_new }}
+      vllm_whl: ${{ steps.detect.outputs.vllm_whl }}
+      vllm_ver: ${{ steps.detect.outputs.vllm_ver }}
+      rocm_stamp: ${{ steps.detect.outputs.rocm_stamp }}
+    steps:
+    - name: Detect new nightly
+      id: detect
+      run: |
+        set -uo pipefail
+        IS_NEW=true
+        if [ "$CHANNEL" = "nightly" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+          NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna
+          WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
+            | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+            | sed 's/%2B/+/g' | sort | tail -1 || true)
+          if [ -n "$WHL" ]; then
+            VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/')
+            STAMP=$(echo "$WHL" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
+            echo "vllm_whl=$WHL"     >> "$GITHUB_OUTPUT"
+            echo "vllm_ver=$VER"     >> "$GITHUB_OUTPUT"
+            echo "rocm_stamp=$STAMP" >> "$GITHUB_OUTPUT"
+            echo "newest nightly wheel: $WHL"
+            # Dedup against the published feed (pass AND fail are recorded there,
+            # so a known-bad nightly is not retried — only a new stamp is).
+            FEED="https://raw.githubusercontent.com/${{ github.repository }}/qualification-data/qualification/index.json"
+            SEEN=$(curl -fsSL "$FEED" 2>/dev/null | VER="$VER" python3 -c 'import sys,json,os; d=json.load(sys.stdin); print("SEEN" if any(b.get("vllm_version")==os.environ["VER"] and b.get("channel")=="nightly" for b in d.get("builds",[])) else "NEW")' 2>/dev/null || echo "NEW")
+            if [ "$SEEN" = "SEEN" ]; then
+              IS_NEW=false
+              echo "Already qualified $VER — skipping this run."
+            else
+              echo "New nightly $VER — running the pipeline."
+            fi
+          else
+            echo "::warning::no cp313 nightly wheel found; proceeding"
+          fi
+        else
+          echo "channel=$CHANNEL event=${{ github.event_name }} — dedup not applicable; proceeding"
+        fi
+        echo "is_new=$IS_NEW" >> "$GITHUB_OUTPUT"
+
   prepare-matrix:
     runs-on: ubuntu-22.04
     outputs:
@@ -52,7 +102,10 @@ jobs:
 
   build-ubuntu:
     runs-on: ubuntu-22.04
-    needs: prepare-matrix
+    needs: [prepare-matrix, detect-nightly]
+    # Skip the whole build (and everything downstream) when this nightly has
+    # already been qualified. is_new is always true for PRs and stable.
+    if: needs.detect-nightly.outputs.is_new == 'true'
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
@@ -138,12 +191,17 @@ jobs:
             gfx120X) DEV=gfx1200 ;;
             *) DEV="${{ matrix.gfx_target }}" ;;
           esac
-          # 1. Newest nightly vLLM wheel + its exact ROCm build stamp.
-          VLLM_WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
-            | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
-            | sed 's/%2B/+/g' | sort | tail -1)
+          # 1. Use the wheel detect-nightly already resolved (so detect and build
+          #    agree even if AMD publishes a newer one mid-run); else discover.
+          VLLM_WHL="${{ needs.detect-nightly.outputs.vllm_whl }}"
+          ROCM_STAMP="${{ needs.detect-nightly.outputs.rocm_stamp }}"
+          if [ -z "$VLLM_WHL" ]; then
+            VLLM_WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
+              | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+              | sed 's/%2B/+/g' | sort | tail -1)
+            ROCM_STAMP=$(echo "$VLLM_WHL" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
+          fi
           [ -n "$VLLM_WHL" ] || { echo "::error::no cp313 nightly vLLM wheel found"; exit 1; }
-          ROCM_STAMP=$(echo "$VLLM_WHL" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
           # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
           # bump TORCH_VER here when vLLM bumps its torch requirement.
           TORCH_VER=2.11.0
