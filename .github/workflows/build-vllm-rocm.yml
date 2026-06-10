@@ -110,7 +110,10 @@ jobs:
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream) when this nightly has
     # already been qualified. is_new is always true for PRs and stable.
-    if: needs.detect-nightly.outputs.is_new == 'true'
+    # Also skip on pull_request: this is a heavy multi-target repackage that now
+    # runs on the shared dev_lab GPU pool, so PR pushes must not tie those boxes
+    # up (and qualify/create-release already skip PRs). Runs on dispatch + cron.
+    if: needs.detect-nightly.outputs.is_new == 'true' && github.event_name != 'pull_request'
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
@@ -203,6 +206,14 @@ jobs:
             gfx120X) DEV=gfx1200 ;;
             *) DEV="${{ matrix.gfx_target }}" ;;
           esac
+          # pip's resolver recurses over the dependency graph; amd-quark drags in
+          # the whole onnx/onnxscript/onnxslim/plotly/rich tree on top of vLLM's
+          # ~70 deps, deep enough to blow Python's default 1000-frame recursion
+          # limit (RecursionError). No pip flag controls this, so run pip via its
+          # entrypoint under a raised limit. Used for the two deep resolves below.
+          pip_deep() {
+            "$VLLM_ROOT/bin/python3" -c 'import sys; sys.setrecursionlimit(20000); from pip._internal.cli.main import main; sys.exit(main(sys.argv[1:]))' "$@"
+          }
           # 1. Use the version detect-nightly already resolved (so detect and
           #    build agree even if AMD publishes a newer one mid-run); else
           #    discover the newest cp313 wheel from the index.
@@ -235,7 +246,7 @@ jobs:
           #    is deliberate: passed globally it strips the Python filter from
           #    every dep, ballooning pip's backtracking until it RecursionErrors.
           #    Once installed and satisfying >=0.8.99, vLLM's resolve accepts it.
-          $VLLM_ROOT/bin/pip install --ignore-requires-python "amd-quark>=0.8.99"
+          pip_deep install --ignore-requires-python "amd-quark>=0.8.99"
           # 3b. The universal vLLM wheel + flash-attn (AMD index) + the rest from
           #    PyPI. Install BY VERSION through the index (not a hand-built wheel
           #    URL): the host serves the wheel only at its %2B-encoded path, so a
@@ -244,7 +255,7 @@ jobs:
           #    torch dep, so the matched torch above is untouched.
           ok=0
           for attempt in 1 2 3; do
-            if $VLLM_ROOT/bin/pip install \
+            if pip_deep install \
                  --extra-index-url "$NIGHTLY_VLLM" \
                  --extra-index-url https://pypi.org/simple/ \
                  "vllm==$VLLM_VER"; then ok=1; break; fi
