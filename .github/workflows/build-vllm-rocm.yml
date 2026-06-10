@@ -172,7 +172,13 @@ jobs:
     - name: Prepare Python environment
       run: |
         # No venv needed — install packages directly into the standalone Python.
-        $VLLM_ROOT/bin/python3 -m pip install --upgrade pip
+        # Pin pip to 24.3.1: it still ships --use-deprecated=legacy-resolver,
+        # which the vLLM install needs. The current resolvelib resolver
+        # RecursionErrors building its result graph on a dependency cycle in
+        # vLLM's closure (resolution.py:_has_route_to_root recurses infinitely,
+        # so no setrecursionlimit saves it); the legacy resolver avoids that path.
+        $VLLM_ROOT/bin/python3 -m pip install "pip==24.3.1"
+        echo "pip: $($VLLM_ROOT/bin/pip --version)"
         echo "Python: $($VLLM_ROOT/bin/python3 --version)"
 
     - name: Install vLLM + PyTorch (channel=${{ env.CHANNEL }})
@@ -253,9 +259,15 @@ jobs:
           #    direct URL with a literal '+' gets WAF-403'd. Letting pip resolve
           #    the index href fetches the correctly-encoded URL. vLLM declares no
           #    torch dep, so the matched torch above is untouched.
+          #    --use-deprecated=legacy-resolver: the new resolvelib resolver
+          #    RecursionErrors building its result graph on a cycle in vLLM's
+          #    dependency closure (resolution.py:_has_route_to_root recurses
+          #    without end). The legacy resolver doesn't walk that graph, so it
+          #    installs the same satisfied set without crashing. (pip pinned to
+          #    24.3.1 above so this flag still exists.)
           ok=0
           for attempt in 1 2 3; do
-            if pip_deep install \
+            if pip_deep install --use-deprecated=legacy-resolver \
                  --extra-index-url "$NIGHTLY_VLLM" \
                  --extra-index-url https://pypi.org/simple/ \
                  "vllm==$VLLM_VER"; then ok=1; break; fi
