@@ -17,6 +17,11 @@ on:
         required: false
         default: true
         type: boolean
+      force:
+        description: 'Re-run even if this nightly was already qualified (bypass dedup)'
+        required: false
+        default: false
+        type: boolean
 
   pull_request:
     types: [opened, synchronize, reopened]
@@ -68,9 +73,11 @@ jobs:
             # so a known-bad nightly is not retried — only a new stamp is).
             FEED="https://raw.githubusercontent.com/${{ github.repository }}/qualification-data/qualification/index.json"
             SEEN=$(curl -fsSL "$FEED" 2>/dev/null | VER="$VER" python3 -c 'import sys,json,os; d=json.load(sys.stdin); print("SEEN" if any(b.get("vllm_version")==os.environ["VER"] and b.get("channel")=="nightly" for b in d.get("builds",[])) else "NEW")' 2>/dev/null || echo "NEW")
-            if [ "$SEEN" = "SEEN" ]; then
+            if [ "$SEEN" = "SEEN" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
               IS_NEW=false
-              echo "Already qualified $VER — skipping this run."
+              echo "Already qualified $VER — skipping this run (dispatch with force=true to re-run)."
+            elif [ "$SEEN" = "SEEN" ]; then
+              echo "Already qualified $VER but force=true — re-running anyway."
             else
               echo "New nightly $VER — running the pipeline."
             fi
