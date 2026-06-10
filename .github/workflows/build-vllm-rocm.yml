@@ -432,14 +432,16 @@ jobs:
       run: |
         [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
 
-  # 15-test qualification on the self-hosted dev_lab box (ta-devlab-halo-02, 200 GB).
-  # Runs the scripts/qualify harness against the built bundle:
+  # 15-test qualification on a self-hosted dev_lab gfx1151 box. Targets the
+  # shared `ubuntu` label (the dev_lab pool: ta-devlab-halo-01/02/03) so it runs
+  # on whichever box is online rather than pinning to one. Runs the
+  # scripts/qualify harness against the built bundle:
   #   tier0 static (5) + tier1 hardware smoke (5) + tier2 functional inference (5)
   # = 15 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on: [self-hosted, Linux, ta-devlab-halo-02]
+    runs-on: [self-hosted, Linux, ubuntu]
     env:
       GFX: gfx1151
     # Only on release builds. Skips PRs, dispatches with create_release=false,
