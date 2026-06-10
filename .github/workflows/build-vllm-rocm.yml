@@ -101,7 +101,12 @@ jobs:
         echo "Generated matrix: $matrix_targets"
 
   build-ubuntu:
-    runs-on: ubuntu-22.04
+    # Self-hosted dev_lab pool (ta-devlab-halo-01/02/03), same `ubuntu` label as
+    # qualify. AMD's frameworks-nightlies host allowlists these boxes' egress but
+    # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
+    # from here. Build needs only network + pip (no GPU); it shares the pool with
+    # qualify, which runs after it via `needs`.
+    runs-on: [self-hosted, Linux, ubuntu]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream) when this nightly has
     # already been qualified. is_new is always true for PRs and stable.
@@ -125,11 +130,18 @@ jobs:
         PBS_TAG="20260602"
         PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.13.13+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
         echo "Downloading portable Python from $PBS_URL"
-        # Extracts to python/ — move to /opt/vllm so it becomes the release root
-        curl -fsSL "$PBS_URL" | tar -xz -C /opt
-        mv /opt/python /opt/vllm
-        /opt/vllm/bin/python3.13 --version
-        echo "Portable Python installed at /opt/vllm"
+        # Build under the runner's temp dir — no sudo, no shared-box pollution,
+        # and isolated per run (the self-hosted boxes are persistent). VLLM_ROOT
+        # is exported so every later step (and the artifact upload) uses it.
+        ROOT="$RUNNER_TEMP/vllm-build/vllm"
+        rm -rf "$RUNNER_TEMP/vllm-build"
+        mkdir -p "$RUNNER_TEMP/vllm-build"
+        # Extracts to python/ — move to vllm/ so it becomes the release root
+        curl -fsSL "$PBS_URL" | tar -xz -C "$RUNNER_TEMP/vllm-build"
+        mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
+        "$ROOT/bin/python3.13" --version
+        echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
+        echo "Portable Python installed at $ROOT"
 
     - name: Map GPU target to AMD wheel URLs
       id: wheel-urls
@@ -157,12 +169,12 @@ jobs:
     - name: Prepare Python environment
       run: |
         # No venv needed — install packages directly into the standalone Python.
-        /opt/vllm/bin/python3 -m pip install --upgrade pip
-        echo "Python: $(/opt/vllm/bin/python3 --version)"
+        $VLLM_ROOT/bin/python3 -m pip install --upgrade pip
+        echo "Python: $($VLLM_ROOT/bin/python3 --version)"
 
     - name: Install vLLM + PyTorch (channel=${{ env.CHANNEL }})
       run: |
-        SP="/opt/vllm/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         TORCH_INDEX="${{ steps.wheel-urls.outputs.torch_index }}"
         VLLM_INDEX="${{ steps.wheel-urls.outputs.vllm_index }}"
 
@@ -172,7 +184,7 @@ jobs:
           # yields a self-consistent set — no reinstall, no version pinning, no
           # ABI reconciliation. Pure repackage of what AMD published.
           echo "stable: installing AMD vLLM + matched AMD PyTorch"
-          /opt/vllm/bin/pip install \
+          $VLLM_ROOT/bin/pip install \
             --index-url "$VLLM_INDEX" \
             --extra-index-url "$TORCH_INDEX" \
             vllm torchvision
@@ -209,23 +221,24 @@ jobs:
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
           #    all resolved at the same ROCm stamp from one index.
-          /opt/vllm/bin/pip install --index-url "$NIGHTLY_TORCH" \
+          $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
             --extra-index-url https://pypi.org/simple/ \
             "torch[device-${DEV}]==${TORCH_VER}+${ROCM_STAMP}"
           # 3. The universal vLLM wheel + flash-attn (AMD index) + the rest from
           #    PyPI. vLLM declares no torch dep, so the matched torch is untouched.
-          #    frameworks-nightlies can 403 a wheel GET transiently and pip does
-          #    not retry 4xx, so retry with backoff before failing the build.
+          #    This GET only succeeds from an allowlisted network — frameworks-
+          #    nightlies 403s GitHub-hosted runner IPs, which is why this job runs
+          #    on the self-hosted dev_lab pool. Light retry for ordinary flakes.
           ok=0
-          for attempt in 1 2 3 4 5; do
-            if /opt/vllm/bin/pip install \
+          for attempt in 1 2 3; do
+            if $VLLM_ROOT/bin/pip install \
                  --extra-index-url "$NIGHTLY_VLLM" \
                  --extra-index-url https://pypi.org/simple/ \
                  "$NIGHTLY_VLLM/$VLLM_WHL"; then ok=1; break; fi
-            echo "::warning::vLLM install attempt $attempt failed (frameworks-nightlies transient 403?); retry in $((attempt*15))s"
-            sleep $((attempt * 15))
+            echo "::warning::vLLM install attempt $attempt failed; retry in $((attempt*10))s"
+            sleep $((attempt * 10))
           done
-          [ "$ok" = 1 ] || { echo "::error::vLLM install failed after 5 attempts"; exit 1; }
+          [ "$ok" = 1 ] || { echo "::error::vLLM install failed after 3 attempts (network/allowlist?)"; exit 1; }
         fi
 
         # Use the AMD pip ROCm SDK amdsmi (_rocm_sdk_core/share/amd_smi) rather
@@ -239,14 +252,14 @@ jobs:
         # Report versions but DO NOT fail the build on a bad combination — a
         # broken bundle must still be packaged so the qualification gate can
         # detect and REPORT it. Fixing upstream is never our job.
-        /opt/vllm/bin/python3 -c "
+        $VLLM_ROOT/bin/python3 -c "
         import torch; print(f'PyTorch {torch.__version__}')
         import vllm; print(f'vLLM {vllm.__version__}')
         " || echo "WARNING: import check failed — qualification will report this"
 
     - name: Pre-compile Triton HIP utilities (eliminates gcc dependency)
       run: |
-        SP="/opt/vllm/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         TRITON_AMD="$SP/triton/backends/amd"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
@@ -266,10 +279,10 @@ jobs:
         # We can't use Triton's compile_module_from_src because it also tries to
         # dlopen the HIP library, which doesn't work on headless CI.
         TRITON_AMD="$SP/triton/backends/amd"
-        PYTHON_INC="/opt/vllm/include/python3.13"
+        PYTHON_INC="$VLLM_ROOT/include/python3.13"
 
         # Generate the C source with the HIP library path baked in
-        /opt/vllm/bin/python3 -c "
+        $VLLM_ROOT/bin/python3 -c "
         from pathlib import Path
         import os
         dirname = '$TRITON_AMD'
@@ -290,11 +303,11 @@ jobs:
         # Patch Triton to load the pre-built .so instead of JIT-compiling
         DRIVER_PY="$TRITON_AMD/driver.py"
         sed -i 's|mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)|_pso = os.path.join(dirname, "hip_utils_prebuilt.so")\n        if os.path.exists(_pso):\n            import importlib.util as _ilu\n            _sp = _ilu.spec_from_file_location("hip_utils", _pso)\n            mod = _ilu.module_from_spec(_sp)\n            _sp.loader.exec_module(mod)\n        else:\n            mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)|' "$DRIVER_PY"
-        /opt/vllm/bin/python3 -c "import ast; ast.parse(open('$DRIVER_PY').read()); print('Patched driver.py — syntax OK')"
+        $VLLM_ROOT/bin/python3 -c "import ast; ast.parse(open('$DRIVER_PY').read()); print('Patched driver.py — syntax OK')"
 
     - name: Create launcher script
       run: |
-        cat > /opt/vllm/bin/vllm-server << 'LAUNCHER_EOF'
+        cat > $VLLM_ROOT/bin/vllm-server << 'LAUNCHER_EOF'
         #!/bin/bash
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         VENV_DIR="$(dirname "$SCRIPT_DIR")"
@@ -316,14 +329,14 @@ jobs:
         LAUNCHER_EOF
 
         # Remove YAML indentation from heredoc
-        sed -i 's/^        //' /opt/vllm/bin/vllm-server
-        chmod +x /opt/vllm/bin/vllm-server
+        sed -i 's/^        //' $VLLM_ROOT/bin/vllm-server
+        chmod +x $VLLM_ROOT/bin/vllm-server
         echo "Launcher script:"
-        cat /opt/vllm/bin/vllm-server
+        cat $VLLM_ROOT/bin/vllm-server
 
     - name: Strip unnecessary files to reduce size
       run: |
-        cd /opt/vllm
+        cd $VLLM_ROOT
         echo "=== Size before cleanup ==="
         du -sh .
 
@@ -385,15 +398,15 @@ jobs:
 
     - name: Verify bundled environment works
       run: |
-        SP="/opt/vllm/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
 
-        /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} OK')"
-        /opt/vllm/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__} OK')"
-        /opt/vllm/bin/python3 -c "
+        $VLLM_ROOT/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} OK')"
+        $VLLM_ROOT/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__} OK')"
+        $VLLM_ROOT/bin/python3 -c "
         # Verify native extensions exist (they load only with GPU present)
         import os, pathlib
         sp = pathlib.Path('$SP/vllm')
@@ -403,42 +416,43 @@ jobs:
             print(f'{ext}: {p.stat().st_size // 1048576} MB')
         print('Native extensions verified')
         "
-        bash -n /opt/vllm/bin/vllm-server
+        bash -n $VLLM_ROOT/bin/vllm-server
         echo "All sanity checks passed"
 
     - name: Report final size
       run: |
         echo "=== Final artifact ==="
-        du -sh /opt/vllm/
+        du -sh $VLLM_ROOT/
         echo ""
-        du -sh /opt/vllm/*/ 2>/dev/null
+        du -sh $VLLM_ROOT/*/ 2>/dev/null
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: /opt/vllm/
+        path: ${{ env.VLLM_ROOT }}/
         retention-days: 30
         compression-level: 6
 
     - name: Set job outputs
       id: set-outputs
       run: |
-        SP="/opt/vllm/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
 
-        vllm_ver=$(/opt/vllm/bin/python3 -c "import vllm; print(vllm.__version__)")
-        torch_ver=$(/opt/vllm/bin/python3 -c "import torch; print(torch.__version__)")
+        vllm_ver=$($VLLM_ROOT/bin/python3 -c "import vllm; print(vllm.__version__)")
+        torch_ver=$($VLLM_ROOT/bin/python3 -c "import torch; print(torch.__version__)")
         echo "vllm_version=$vllm_ver" >> $GITHUB_OUTPUT
         echo "torch_version=$torch_ver" >> $GITHUB_OUTPUT
 
     - name: Clean up
       if: always()
       run: |
-        [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
+        # No sudo — it's under the runner's temp dir. Free the box for the next run.
+        rm -rf "$RUNNER_TEMP/vllm-build" || true
 
   # 15-test qualification on a self-hosted dev_lab gfx1151 box. Targets the
   # shared `ubuntu` label (the dev_lab pool: ta-devlab-halo-01/02/03) so it runs
