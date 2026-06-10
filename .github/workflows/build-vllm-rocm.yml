@@ -203,21 +203,23 @@ jobs:
             gfx120X) DEV=gfx1200 ;;
             *) DEV="${{ matrix.gfx_target }}" ;;
           esac
-          # 1. Use the wheel detect-nightly already resolved (so detect and build
-          #    agree even if AMD publishes a newer one mid-run); else discover.
-          VLLM_WHL="${{ needs.detect-nightly.outputs.vllm_whl }}"
+          # 1. Use the version detect-nightly already resolved (so detect and
+          #    build agree even if AMD publishes a newer one mid-run); else
+          #    discover the newest cp313 wheel from the index.
+          VLLM_VER="${{ needs.detect-nightly.outputs.vllm_ver }}"
           ROCM_STAMP="${{ needs.detect-nightly.outputs.rocm_stamp }}"
-          if [ -z "$VLLM_WHL" ]; then
-            VLLM_WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
+          if [ -z "$VLLM_VER" ]; then
+            WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
               | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
-              | sed 's/%2B/+/g' | sort | tail -1)
-            ROCM_STAMP=$(echo "$VLLM_WHL" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
+              | sort | tail -1)
+            VLLM_VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/' | sed 's/%2B/+/g')
+            ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
           fi
-          [ -n "$VLLM_WHL" ] || { echo "::error::no cp313 nightly vLLM wheel found"; exit 1; }
+          [ -n "$VLLM_VER" ] || { echo "::error::no cp313 nightly vLLM version found"; exit 1; }
           # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
           # bump TORCH_VER here when vLLM bumps its torch requirement.
           TORCH_VER=2.11.0
-          echo "nightly: vLLM=$VLLM_WHL"
+          echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
           #    all resolved at the same ROCm stamp from one index.
@@ -225,20 +227,21 @@ jobs:
             --extra-index-url https://pypi.org/simple/ \
             "torch[device-${DEV}]==${TORCH_VER}+${ROCM_STAMP}"
           # 3. The universal vLLM wheel + flash-attn (AMD index) + the rest from
-          #    PyPI. vLLM declares no torch dep, so the matched torch is untouched.
-          #    This GET only succeeds from an allowlisted network — frameworks-
-          #    nightlies 403s GitHub-hosted runner IPs, which is why this job runs
-          #    on the self-hosted dev_lab pool. Light retry for ordinary flakes.
+          #    PyPI. Install BY VERSION through the index (not a hand-built wheel
+          #    URL): the host serves the wheel only at its %2B-encoded path, so a
+          #    direct URL with a literal '+' gets WAF-403'd. Letting pip resolve
+          #    the index href fetches the correctly-encoded URL. vLLM declares no
+          #    torch dep, so the matched torch above is untouched.
           ok=0
           for attempt in 1 2 3; do
             if $VLLM_ROOT/bin/pip install \
                  --extra-index-url "$NIGHTLY_VLLM" \
                  --extra-index-url https://pypi.org/simple/ \
-                 "$NIGHTLY_VLLM/$VLLM_WHL"; then ok=1; break; fi
+                 "vllm==$VLLM_VER"; then ok=1; break; fi
             echo "::warning::vLLM install attempt $attempt failed; retry in $((attempt*10))s"
             sleep $((attempt * 10))
           done
-          [ "$ok" = 1 ] || { echo "::error::vLLM install failed after 3 attempts (network/allowlist?)"; exit 1; }
+          [ "$ok" = 1 ] || { echo "::error::vLLM install failed after 3 attempts"; exit 1; }
         fi
 
         # Use the AMD pip ROCm SDK amdsmi (_rocm_sdk_core/share/amd_smi) rather
