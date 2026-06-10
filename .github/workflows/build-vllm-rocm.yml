@@ -259,15 +259,20 @@ jobs:
           #    direct URL with a literal '+' gets WAF-403'd. Letting pip resolve
           #    the index href fetches the correctly-encoded URL. vLLM declares no
           #    torch dep, so the matched torch above is untouched.
+          #    Two flags, both required and complementary:
           #    --use-deprecated=legacy-resolver: the new resolvelib resolver
           #    RecursionErrors building its result graph on a cycle in vLLM's
           #    dependency closure (resolution.py:_has_route_to_root recurses
-          #    without end). The legacy resolver doesn't walk that graph, so it
-          #    installs the same satisfied set without crashing. (pip pinned to
-          #    24.3.1 above so this flag still exists.)
+          #    without end). The legacy resolver doesn't walk that graph. (pip is
+          #    pinned to 24.3.1 above so this flag still exists.)
+          #    --ignore-requires-python: the legacy resolver re-checks
+          #    requires-python on the already-installed amd-quark (0.11.2, capped
+          #    <3.13) and hard-errors on cp313; the flag makes it accept it. On
+          #    the legacy (first-found, no-backtrack) resolver this can't balloon
+          #    the candidate search the way it would on the new resolver.
           ok=0
           for attempt in 1 2 3; do
-            if pip_deep install --use-deprecated=legacy-resolver \
+            if pip_deep install --use-deprecated=legacy-resolver --ignore-requires-python \
                  --extra-index-url "$NIGHTLY_VLLM" \
                  --extra-index-url https://pypi.org/simple/ \
                  "vllm==$VLLM_VER"; then ok=1; break; fi
