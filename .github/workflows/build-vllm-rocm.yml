@@ -306,6 +306,11 @@ jobs:
           #    transformers needs tokenizers>=0.22.0,<=0.23.0 but legacy pulled
           #    0.23.1, raising ImportError at import; pin it back into range.
           $VLLM_ROOT/bin/pip install "tokenizers>=0.22.0,<=0.23.0"
+          #    pycountry: an OPTIONAL transitive nothing declares as a hard dep
+          #    (vLLM -> mistral_common -> pydantic_extra_types.language_code ->
+          #    pycountry), so no resolver installs it, yet mistral_common imports
+          #    it at module load and vllm-server dies without it. Add explicitly.
+          $VLLM_ROOT/bin/pip install pycountry
           $VLLM_ROOT/bin/pip check || echo "::warning::pip check reported dependency conflicts (see above); qualify will gate"
         fi
 
