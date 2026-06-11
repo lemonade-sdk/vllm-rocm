@@ -1,7 +1,60 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-06-11T00:09:02Z",
+  "updated_at": "2026-06-11T00:21:26Z",
   "builds": [
+    {
+      "build_id": "27314742341-gfx1151-nightly",
+      "tag": "vllm0.21.1.dev0+rocm7.14.0a20260603.gad7125a43.d20260604-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "nightly",
+      "generated_at": "2026-06-11T00:21:26Z",
+      "run_id": "27314742341",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/27314742341",
+      "vllm_version": "0.21.1.dev0+rocm7.14.0a20260603.gad7125a43.d20260604",
+      "torch_version": "2.11.0+rocm7.14.0a20260603",
+      "rocm_version": "7.14.0",
+      "tests": {
+        "passed": 8,
+        "failed": 6,
+        "warned": 1,
+        "skipped": 0,
+        "total": 15
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier0=warn",
+        "tier1=fail",
+        "tier2 missing"
+      ],
+      "summary": {
+        "title": "vLLM-server launch fails: missing pycountry dependency",
+        "recommended_action": "Add pycountry to vLLM dependencies or mistral_common requirements; verify torch version pinning in vllm package metadata",
+        "blocking_tests": [
+          "T1.5"
+        ],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "warn",
+        "T0.2": "pass",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "pass",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "fail",
+        "T2.1": "missing",
+        "T2.2": "missing",
+        "T2.3": "missing",
+        "T2.4": "missing",
+        "T2.5": "missing"
+      },
+      "report_url": "reports/27314742341-gfx1151-nightly.json"
+    },
     {
       "build_id": "27314302730-gfx1151-nightly",
       "tag": "vllm0.21.1.dev0+rocm7.14.0a20260603.gad7125a43.d20260604-gfx1151",
