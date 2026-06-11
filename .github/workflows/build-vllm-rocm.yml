@@ -288,14 +288,23 @@ jobs:
           done
           [ "$ok" = 1 ] || { echo "::error::vLLM install failed after 3 attempts"; exit 1; }
           # 3c. Repair legacy-resolver over-picks. The legacy resolver takes the
-          #    first-found version and ignores transitive UPPER bounds, so it can
-          #    leave a too-new transitive dep. transformers needs
-          #    tokenizers>=0.22.0,<=0.23.0 but legacy pulled 0.23.1, which makes
-          #    transformers raise ImportError at import and breaks vllm-server
-          #    (caught by qualify T1.5). Pin it back into range (a one-package
-          #    resolve — no cycle). `pip check` then surfaces any OTHER legacy
-          #    mis-pick in the build log without failing the build (qualify is
-          #    the real gate).
+          #    first-found version and ignores transitive UPPER bounds / ABI, so
+          #    it leaves deps that break vLLM at import (each caught by qualify
+          #    T1.5). Re-assert the correct ones here (small single-package
+          #    resolves — no cycle), then `pip check` surfaces any remaining
+          #    mis-pick in the build log without failing the build (qualify gates).
+          #
+          #    torchvision must match the ROCm torch ABI or its C++ ops
+          #    (torchvision::nms) fail to register and `import vllm` dies. Legacy
+          #    pulled a PyPI torchvision built against a different torch; force the
+          #    matched ROCm build from the nightly index, same rocm stamp. torch
+          #    2.11 pairs with torchvision 0.26 — bump TV_VER with TORCH_VER.
+          TV_VER=0.26.0
+          $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torchvision==${TV_VER}+${ROCM_STAMP}"
+          #    transformers needs tokenizers>=0.22.0,<=0.23.0 but legacy pulled
+          #    0.23.1, raising ImportError at import; pin it back into range.
           $VLLM_ROOT/bin/pip install "tokenizers>=0.22.0,<=0.23.0"
           $VLLM_ROOT/bin/pip check || echo "::warning::pip check reported dependency conflicts (see above); qualify will gate"
         fi
