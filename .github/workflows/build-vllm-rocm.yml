@@ -245,15 +245,21 @@ jobs:
 
         # Trim LLVM toolchain: keep only clang + its libs (~350MB saved)
         LLVM="$SP/_rocm_sdk_core/lib/llvm"
-        # Keep only clang, clang-22, remove everything else from bin/
-        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-22" -delete 2>/dev/null || true
+        # The `clang` driver re-execs the versioned `clang-<major>` binary, so we
+        # must keep whichever major this LLVM actually is. Derive it instead of
+        # hardcoding (the resource dir lib/clang/<major> is the source of truth);
+        # fall back to `clang -dumpversion`.
+        CLANG_MAJOR="$(ls "$LLVM/lib/clang" 2>/dev/null | grep -E "^[0-9]+$" | sort -n | tail -1)"
+        [ -z "$CLANG_MAJOR" ] && CLANG_MAJOR="$("$LLVM/bin/clang" -dumpversion 2>/dev/null | cut -d. -f1)"
+        # Keep only clang + clang-<major>, remove everything else from bin/
+        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-${CLANG_MAJOR}" -delete 2>/dev/null || true
         find "$LLVM/bin" -type l ! -name "clang" -delete 2>/dev/null || true
         # Keep only libs that clang needs (libclang-cpp, libLLVM, rocm_sysdeps)
         find "$LLVM/lib" -name "*.so*" \
           ! -name "libclang-cpp*" \
           ! -name "libLLVM*" \
           -delete 2>/dev/null || true
-        rm -rf "$LLVM/lib/clang/22/include/cuda_wrappers" 2>/dev/null || true
+        rm -rf "$LLVM/lib/clang/${CLANG_MAJOR}/include/cuda_wrappers" 2>/dev/null || true
 
         # Trim ROCm SDK bin/ (Python wrapper scripts, not needed)
         rm -rf "$SP/_rocm_sdk_core/bin" 2>/dev/null || true
