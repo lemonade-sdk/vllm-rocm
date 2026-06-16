@@ -50,13 +50,20 @@ jobs:
         "$PY" -m pip install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch \
           --extra-index-url https://pypi.org/simple/ \
           "${{ github.event.inputs.torch_spec || 'torch[device-gfx1151]==2.11.0+rocm7.14.0a20260603' }}"
-        echo "=== kernel launch (AMD_LOG_LEVEL=3) ==="
-        AMD_LOG_LEVEL=3 AMD_SERIALIZE_KERNEL=3 "$PY" -c "
+        echo "=== kernel launches (torch-only; AMD_SERIALIZE_KERNEL=3 makes errors synchronous) ==="
+        AMD_SERIALIZE_KERNEL=3 "$PY" -c "
         import torch
-        print('torch', torch.__version__)
-        print('device', torch.cuda.get_device_name())
-        x = torch.zeros(4, device='cuda')   # first real kernel launch
-        print('RESULT', (x + 1).cpu().tolist())
-        print('GPU KERNEL LAUNCH OK')
-        " 2>&1 | tail -60
+        print('torch', torch.__version__, '| device', torch.cuda.get_device_name())
+        def step(name, fn):
+            try:
+                out = fn(); torch.cuda.synchronize(); print('OK  ', name, out)
+            except Exception as e:
+                print('FAIL', name, '->', type(e).__name__, str(e).splitlines()[0])
+        step('zeros+add f32',  lambda: (torch.zeros(4, device='cuda') + 1).cpu().tolist())
+        step('zeros int32 cuda', lambda: torch.zeros(8, dtype=torch.int32, device='cuda').cpu().tolist())
+        # the exact op vLLM dies on: zeros_like from a PINNED int32 host tensor -> cuda
+        step('zeros_like pinned int32', lambda: torch.zeros_like(torch.zeros(8, dtype=torch.int32, pin_memory=True), device='cuda').cpu().tolist())
+        step('matmul f16 64x64', lambda: float((torch.randn(64,64,device='cuda',dtype=torch.float16) @ torch.randn(64,64,device='cuda',dtype=torch.float16)).sum()))
+        print('DONE')
+        " 2>&1 | tail -40
         rm -rf "$ROOT"
