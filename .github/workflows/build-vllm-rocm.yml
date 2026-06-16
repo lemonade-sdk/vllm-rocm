@@ -539,6 +539,12 @@ jobs:
     runs-on: [self-hosted, Linux, ubuntu]
     env:
       GFX: gfx1151
+      # Make HIP kernel errors synchronous so an invalid code-object surfaces at
+      # the actual failing kernel (not a later sync point). Diagnostic for the
+      # gfx1151 hipErrorInvalidImage in vLLM init; AMD_LOG_LEVEL=2 prints the
+      # code-object load so the offending kernel/component is named.
+      AMD_SERIALIZE_KERNEL: "3"
+      AMD_LOG_LEVEL: "2"
     # Only on release builds. Skips PRs, dispatches with create_release=false,
     # and dispatches that didn't select gfx1151 (nothing to test → release ungated).
     if: >-
