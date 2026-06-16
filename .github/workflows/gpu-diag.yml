@@ -4,6 +4,12 @@ name: GPU Diag (driver + torch kernel launch)
 # tell apart "code objects won't load (driver/ISA/xnack mismatch)" from a working
 # box. Pinned by runner-name label so we can target a specific box.
 on:
+  # push trigger (scoped to this file) so it runs from the feature branch without
+  # the workflow_dispatch "must be on default branch" limitation. Runner defaults
+  # to ta-devlab-halo-01 on push.
+  push:
+    branches: [feat/build-qualification]
+    paths: ['.github/workflows/gpu-diag.yml']
   workflow_dispatch:
     inputs:
       runner:
