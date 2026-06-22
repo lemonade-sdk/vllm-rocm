@@ -194,16 +194,59 @@ jobs:
         TORCH_INDEX="${{ steps.wheel-urls.outputs.torch_index }}"
         VLLM_INDEX="${{ steps.wheel-urls.outputs.vllm_index }}"
 
+        # vLLM's dependency graph trips pip's resolvelib resolver into a
+        # RecursionError (a cycle in its closure), on BOTH channels. No pip flag
+        # controls the recursion depth, so run pip via its entrypoint under a
+        # raised limit; combined with --use-deprecated=legacy-resolver below this
+        # is what lets the install complete. (pip pinned to 24.3.1 in Prepare.)
+        pip_deep() {
+          "$VLLM_ROOT/bin/python3" -c 'import sys; sys.setrecursionlimit(20000); from pip._internal.cli.main import main; sys.exit(main(sys.argv[1:]))' "$@"
+        }
+
         if [ "$CHANNEL" = "stable" ]; then
-          # STABLE: repackage AMD's own matched set. AMD's vLLM wheel declares
-          # its AMD PyTorch dependency, so resolving everything from AMD indexes
-          # yields a self-consistent set — no reinstall, no version pinning, no
-          # ABI reconciliation. Pure repackage of what AMD published.
-          echo "stable: installing AMD vLLM + matched AMD PyTorch"
-          $VLLM_ROOT/bin/pip install \
-            --index-url "$VLLM_INDEX" \
-            --extra-index-url "$TORCH_INDEX" \
-            vllm torchvision
+          # STABLE: AMD's per-card matched set — the OLDER one-build-per-gfx
+          # pattern (vLLM at rocm.frameworks.amd.com/whl/<gfx>/, torch at
+          # repo.amd.com/rocm/whl/<gfx>/), NOT the nightly single-RDNA build.
+          # ROCm 7.13 / torch 2.9.1 — a different code-object generation than the
+          # 7.14 nightly, which is the point of this validation run. Same robust
+          # install technique as nightly (legacy resolver + matched-torchvision
+          # repair), pointed at the stable sources.
+          # Discover the newest cp313 vLLM on the gfx index.
+          VLLM_VER=$(curl -fsSL "$VLLM_INDEX/vllm/" \
+            | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+            | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/; s/%2B/+/g' \
+            | sort | tail -1)
+          [ -n "$VLLM_VER" ] || { echo "::error::no cp313 stable vLLM wheel at $VLLM_INDEX"; exit 1; }
+          echo "stable: vLLM==$VLLM_VER"
+          # 1. Matched torch from the stable ROCm index (pulls rocm-sdk-* + triton
+          #    at the rocm7.13.0 ABI). Pinned to the stamp; bump when AMD updates.
+          $VLLM_ROOT/bin/pip install --index-url "$TORCH_INDEX" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torch==2.9.1+rocm7.13.0"
+          # 2. vLLM by version from the gfx index + PyPI for the ~70 normal deps.
+          #    Same legacy resolver as nightly (the recursion cycle is in vLLM's
+          #    graph regardless of channel); --ignore-requires-python guards any
+          #    amd-quark cp<3.13 cap.
+          ok=0
+          for attempt in 1 2 3; do
+            if pip_deep install --use-deprecated=legacy-resolver --ignore-requires-python \
+                 --extra-index-url "$VLLM_INDEX" \
+                 --extra-index-url "$TORCH_INDEX" \
+                 --extra-index-url https://pypi.org/simple/ \
+                 "vllm==$VLLM_VER"; then ok=1; break; fi
+            echo "::warning::stable vLLM install attempt $attempt failed; retry in $((attempt*10))s"
+            sleep $((attempt * 10))
+          done
+          [ "$ok" = 1 ] || { echo "::error::stable vLLM install failed after 3 attempts"; exit 1; }
+          # 3. Repair: the legacy resolver may have pulled a PyPI torchvision with
+          #    the wrong torch ABI (torchvision::nms unregistered -> import dies).
+          #    Force the matched ROCm build AFTER vLLM. pycountry is an undeclared
+          #    optional transitive (mistral_common). pip check surfaces the rest.
+          $VLLM_ROOT/bin/pip install --index-url "$TORCH_INDEX" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torchvision==0.26.0+rocm7.13.0"
+          $VLLM_ROOT/bin/pip install pycountry
+          $VLLM_ROOT/bin/pip check || echo "::warning::pip check reported conflicts (see above); qualify will gate"
         else
           # NIGHTLY: repackage AMD's OFFICIAL nightly. AMD publishes a single
           # universal RDNA vLLM wheel plus a date-stamped matched torch; we pair
@@ -219,14 +262,6 @@ jobs:
             gfx120X) DEV=gfx1200 ;;
             *) DEV="${{ matrix.gfx_target }}" ;;
           esac
-          # pip's resolver recurses over the dependency graph; amd-quark drags in
-          # the whole onnx/onnxscript/onnxslim/plotly/rich tree on top of vLLM's
-          # ~70 deps, deep enough to blow Python's default 1000-frame recursion
-          # limit (RecursionError). No pip flag controls this, so run pip via its
-          # entrypoint under a raised limit. Used for the two deep resolves below.
-          pip_deep() {
-            "$VLLM_ROOT/bin/python3" -c 'import sys; sys.setrecursionlimit(20000); from pip._internal.cli.main import main; sys.exit(main(sys.argv[1:]))' "$@"
-          }
           # 1. Use the version detect-nightly already resolved (so detect and
           #    build agree even if AMD publishes a newer one mid-run); else
           #    discover the newest cp313 wheel from the index.
@@ -539,12 +574,6 @@ jobs:
     runs-on: [self-hosted, Linux, ubuntu]
     env:
       GFX: gfx1151
-      # Make HIP kernel errors synchronous so an invalid code-object surfaces at
-      # the actual failing kernel (not a later sync point). Diagnostic for the
-      # gfx1151 hipErrorInvalidImage in vLLM init; AMD_LOG_LEVEL=2 prints the
-      # code-object load so the offending kernel/component is named.
-      AMD_SERIALIZE_KERNEL: "3"
-      AMD_LOG_LEVEL: "2"
     # Only on release builds. Skips PRs, dispatches with create_release=false,
     # and dispatches that didn't select gfx1151 (nothing to test → release ungated).
     if: >-
