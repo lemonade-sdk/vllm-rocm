@@ -227,13 +227,15 @@ jobs:
           echo "stable: vLLM==$VLLM_VER"
           # 1. Matched torch from the stable ROCm index (pulls rocm-sdk-* + triton
           #    at the rocm7.13.0 ABI). The index carries torch 2.9.1 / 2.10.0 /
-          #    2.11.0 all at +rocm7.13.0; vLLM 0.19.1's native ext needs the
-          #    NEWEST c10 ABI (2.9.1 left 7 unresolved c10::*[abi:cxx11] symbols
-          #    -> tier0 T0.2 fail), and 2.11 is the canonical pair for the
-          #    torchvision 0.26.0 below (2.9->tv0.24, 2.10->tv0.25, 2.11->tv0.26).
+          #    2.11.0 all at +rocm7.13.0; vLLM 0.19.1's own code guards pin it to
+          #    torch 2.9.x (>=2.9.0,<2.10.0), so use 2.9.1. NOTE: even this
+          #    code-correct version currently leaves unresolved c10::*[abi:cxx11]
+          #    symbols (tier0 T0.2) — AMD's stable vLLM wheel was built with a
+          #    different _GLIBCXX_USE_CXX11_ABI than its stable torch. That's an
+          #    upstream ABI skew the gate reports; we do not pin around it.
           $VLLM_ROOT/bin/pip install --index-url "$TORCH_INDEX" \
             --extra-index-url https://pypi.org/simple/ \
-            "torch==2.11.0+rocm7.13.0"
+            "torch==2.9.1+rocm7.13.0"
           # 2. vLLM by version from the gfx index + PyPI for the ~70 normal deps.
           #    Same legacy resolver as nightly (the recursion cycle is in vLLM's
           #    graph regardless of channel); --ignore-requires-python guards any
@@ -255,7 +257,7 @@ jobs:
           #    optional transitive (mistral_common). pip check surfaces the rest.
           $VLLM_ROOT/bin/pip install --index-url "$TORCH_INDEX" \
             --extra-index-url https://pypi.org/simple/ \
-            "torchvision==0.26.0+rocm7.13.0"
+            "torchvision==0.24.0+rocm7.13.0"
           $VLLM_ROOT/bin/pip install pycountry
           $VLLM_ROOT/bin/pip check || echo "::warning::pip check reported conflicts (see above); qualify will gate"
         else

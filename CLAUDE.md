@@ -20,12 +20,12 @@ and **both promote prerelease → release only on a green qualification.**
 
 | Channel | What it is | Source | Expectation |
 |---------|-----------|--------|-------------|
-| **stable** | Pure repackage of AMD's matched, self-consistent set | AMD's published vLLM + PyTorch (`rocm.frameworks.amd.com` / `repo.amd.com`) | Should pass; lags upstream vLLM |
-| **nightly** | Latest vLLM on latest ROCm, composed by us | vLLM project ROCm wheels (`wheels.vllm.ai/rocm`) + latest AMD ROCm PyTorch | Bleeding edge; **may legitimately be red** when latest vLLM and latest ROCm are incompatible |
+| **stable** | Pure repackage of AMD's matched, self-consistent set | AMD's published per-gfx vLLM (`rocm.frameworks.amd.com/whl/<gfx>`) + PyTorch (`repo.amd.com/rocm/whl/<gfx>`) | Should pass; lags upstream vLLM |
+| **nightly** | AMD's official nightly, date-stamp-matched by us | AMD's universal-RDNA nightly vLLM (`rocm.frameworks-nightlies.amd.com/whl/device-all-rdna`) + the AMD ROCm PyTorch carrying the same `rocm7.X.0a<DATE>` build stamp (`rocm.nightlies.amd.com/whl-multi-arch`) | Bleeding edge; **may legitimately be red** when the newest vLLM + ROCm aren't yet usable on the target GPU |
 
 A red nightly is a correct outcome, not a bug to fix: it reports that the
-newest vLLM + newest ROCm don't yet work together. It stays a prerelease until
-it goes green on its own.
+newest AMD vLLM + ROCm aren't yet usable together on the target hardware. It
+stays a prerelease until it goes green on its own.
 
 ## Inviolable principles
 
@@ -62,28 +62,40 @@ it goes green on its own.
    remain downloadable prereleases with their qualification report attached.
    Lemonade only auto-discovers full releases.
 
-6. **Automation.** Packaging + qualification runs automatically: **stable**
-   whenever AMD publishes a new vLLM/ROCm wheel, **nightly** on a schedule
-   tracking the latest vLLM + ROCm. No manual step for either.
+6. **Automation.** **nightly** runs automatically on a daily schedule: a
+   `detect-nightly` job polls AMD's `device-all-rdna` index and dedups against
+   the published feed, so the pipeline only does real work when a genuinely new
+   nightly wheel appears. **stable** runs on demand (`workflow_dispatch` with
+   `channel=stable`, vLLM version via the `stable_vllm_ver` input); auto-trigger
+   on a new AMD stable wheel is future work. (Scheduled runs only fire from the
+   default branch — this must be on `main` to run nightly.)
 
 ## Source of truth (per channel)
 
-- **stable** repackages AMD's own matched set: AMD vLLM (`rocm.frameworks.amd.com`)
-  resolved against AMD PyTorch (`repo.amd.com`). Because AMD builds the vLLM
-  wheel against that PyTorch, the set is self-consistent — no reinstall, no
-  pinning, no ABI reconciliation.
-- **nightly** repackages the vLLM project's ROCm wheel (`wheels.vllm.ai/rocm`)
-  on the latest AMD ROCm PyTorch. This is the channel that surfaces
-  incompatibilities (e.g. `vllm0.21.0` linked against `c10::hip` while the
-  latest AMD torch exposes `c10::cuda`). We do **not** pin around it; the
-  qualification suite reports nightly red and it stays a prerelease.
+- **stable** repackages AMD's own per-gfx matched set: AMD vLLM
+  (`rocm.frameworks.amd.com/whl/<gfx>`) against AMD PyTorch
+  (`repo.amd.com/rocm/whl/<gfx>`). AMD builds the vLLM wheel against that
+  PyTorch, so the set is intended to be self-consistent.
+- **nightly** repackages AMD's official **universal-RDNA** nightly vLLM
+  (`rocm.frameworks-nightlies.amd.com/whl/device-all-rdna` — one wheel covering
+  gfx1100..gfx1201) paired with the AMD ROCm PyTorch carrying the **same ROCm
+  build stamp** (`rocm7.X.0a<DATE>`) from `rocm.nightlies.amd.com/whl-multi-arch`.
+  Pairing torch to the vLLM wheel's stamp is the channel's *definition* (it
+  selects the matched component, by construction ABI-consistent) — not a
+  reconciliation to force an incompatible combination. This is the channel that
+  surfaces breakage on the newest stack (e.g. a vLLM↔torch C++-ABI skew, or GPU
+  kernels invalid for a target arch); the qualification suite reports it red and
+  it stays a prerelease. We never patch or swap a component to dodge that.
 
 ## Qualification suite
 
-See `scripts/qualify/README.md`. Tiers 0-3 (static → hardware smoke →
-standalone inference → Lemonade integration) emit dashboard-friendly JSON
-records that accumulate on the `build-results` branch. The suite only ever
-**measures** the bundle; it must never alter it to pass.
+See `scripts/qualify/README.md`. Tiers 0-2 (static → hardware smoke →
+standalone inference) emit dashboard-friendly JSON records that accumulate on
+the `qualification-data` branch (see `docs/qualification-feed.md`). Tier 3
+(Lemonade integration) is intentionally **not** here — under the producer/
+consumer split, lemonade validates integration on adoption via its own
+`validate_vllm.yml`. The suite only ever **measures** the bundle; it must never
+alter it to pass.
 
 ## What NOT to do here
 
