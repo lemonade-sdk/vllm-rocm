@@ -212,6 +212,15 @@ jobs:
         TORCH_INDEX="${{ steps.wheel-urls.outputs.torch_index }}"
         VLLM_INDEX="${{ steps.wheel-urls.outputs.vllm_index }}"
 
+        # Steer any CMake-based source build (notably onnx, pulled by amd-quark)
+        # at our bundled Python. On cp314/x86_64 some deps have no wheel yet —
+        # onnx 1.19.0 (amd-quark caps onnx<=1.19.0) only ships a cp314 *aarch64*
+        # wheel, so x86_64 falls back to the sdist. onnx's CMake find_package
+        # (Python3) otherwise grabs the box's system python (3.12) and emits a
+        # cpython-312 ext that pip can't use; pinning the interpreter makes it
+        # build a cpython-${PYVER} ext. (No-op when a wheel is used, e.g. stable.)
+        export CMAKE_ARGS="${CMAKE_ARGS:-} -DPython3_EXECUTABLE=$VLLM_ROOT/bin/python3 -DPython_EXECUTABLE=$VLLM_ROOT/bin/python3"
+
         # vLLM's dependency graph trips pip's resolvelib resolver into a
         # RecursionError (a cycle in its closure), on BOTH channels. No pip flag
         # controls the recursion depth, so run pip via its entrypoint under a
