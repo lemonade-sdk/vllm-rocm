@@ -1,7 +1,62 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-06-23T19:13:25Z",
+  "updated_at": "2026-06-23T19:37:27Z",
   "builds": [
+    {
+      "build_id": "28051380354-gfx1151-stable",
+      "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "stable",
+      "generated_at": "2026-06-23T19:37:27Z",
+      "run_id": "28051380354",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/28051380354",
+      "vllm_version": "0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513",
+      "torch_version": "2.11.0+rocm7.13.0",
+      "rocm_version": "7.13.0",
+      "tests": {
+        "passed": 6,
+        "failed": 8,
+        "warned": 1,
+        "skipped": 0,
+        "total": 15
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier0=fail",
+        "tier1=fail",
+        "tier2 missing"
+      ],
+      "summary": {
+        "title": "torch ABI mismatch in native extensions",
+        "recommended_action": "Rebuild vLLM 0.19.1.dev3 native extensions (_C.abi3.so, _rocm_C.abi3.so) against torch 2.11.0+rocm7.13.0 used in this environment, or use a vLLM wheel pre-built with the same torch version and ROCm 7.13.0.",
+        "blocking_tests": [
+          "T0.2",
+          "T1.1",
+          "T1.5"
+        ],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "warn",
+        "T0.2": "fail",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "fail",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "fail",
+        "T2.1": "missing",
+        "T2.2": "missing",
+        "T2.3": "missing",
+        "T2.4": "missing",
+        "T2.5": "missing"
+      },
+      "report_url": "reports/28051380354-gfx1151-stable.json"
+    },
     {
       "build_id": "28042946832-gfx1151-stable",
       "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
