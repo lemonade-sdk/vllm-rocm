@@ -22,6 +22,10 @@ on:
         required: false
         default: false
         type: boolean
+      stable_vllm_ver:
+        description: 'Stable channel: vLLM version to install (cp313 wheel at rocm.frameworks.amd.com/whl/gfx1151/vllm/)'
+        required: false
+        default: '0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513'
 
   pull_request:
     types: [opened, synchronize, reopened]
@@ -214,12 +218,12 @@ jobs:
           # 7.14 nightly, which is the point of this validation run. Same robust
           # install technique as nightly (legacy resolver + matched-torchvision
           # repair), pointed at the stable sources.
-          # Discover the newest cp313 vLLM on the gfx index.
-          VLLM_VER=$(curl -fsSL "$VLLM_INDEX/vllm/" \
-            | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
-            | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/; s/%2B/+/g' \
-            | sort | tail -1)
-          [ -n "$VLLM_VER" ] || { echo "::error::no cp313 stable vLLM wheel at $VLLM_INDEX"; exit 1; }
+          # Pin the cp313 stable vLLM version (don't curl-discover): rocm.
+          # frameworks.amd.com WAF-403s a raw directory-listing GET from the
+          # runner's IP, but pip's PEP503 index access through --extra-index-url
+          # works. Bump this when AMD publishes a newer stable cp313 wheel at
+          # rocm.frameworks.amd.com/whl/gfx1151/vllm/ .
+          VLLM_VER="${{ github.event.inputs.stable_vllm_ver || '0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513' }}"
           echo "stable: vLLM==$VLLM_VER"
           # 1. Matched torch from the stable ROCm index (pulls rocm-sdk-* + triton
           #    at the rocm7.13.0 ABI). Pinned to the stamp; bump when AMD updates.
