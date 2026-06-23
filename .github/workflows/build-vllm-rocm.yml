@@ -2,6 +2,12 @@ name: Build vLLM + ROCm
 on:
   workflow_dispatch:
     inputs:
+      channel:
+        description: 'Build channel: stable (AMD matched set) or nightly (latest vLLM+ROCm)'
+        required: false
+        default: 'nightly'
+        type: choice
+        options: [nightly, stable]
       gfx_target:
         description: 'AMD GPU targets (comma-separated)'
         required: false
@@ -11,17 +17,82 @@ on:
         required: false
         default: true
         type: boolean
+      force:
+        description: 'Re-run even if this nightly was already qualified (bypass dedup)'
+        required: false
+        default: false
+        type: boolean
+      stable_vllm_ver:
+        description: 'Stable channel: vLLM version to install (cp313 wheel at rocm.frameworks.amd.com/whl/gfx1151/vllm/)'
+        required: false
+        default: '0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513'
 
   pull_request:
     types: [opened, synchronize, reopened]
 
   schedule:
-    - cron: '0 15 * * 0'
+    # Daily: poll for a new nightly. The detect-nightly job dedups against the
+    # qualification feed, so days with no new wheel cost only the cheap poll.
+    - cron: '0 15 * * *'
 
 env:
   GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
+  # Channel is a run-level parameter (not a matrix axis): stable and nightly
+  # have different triggers and different upstream sources, so they run as
+  # separate workflow runs. Scheduled runs default to nightly.
+  CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
 
 jobs:
+  # Decide whether AMD has published a nightly vLLM wheel we have not already
+  # qualified. Dedup key = the wheel's full version string, checked against the
+  # published qualification feed (which records every run, pass OR fail). This
+  # gates the pipeline so the daily cron only does real work when a genuinely
+  # new nightly appears. No-op (is_new=true) for PRs and the stable channel.
+  detect-nightly:
+    runs-on: ubuntu-22.04
+    outputs:
+      is_new: ${{ steps.detect.outputs.is_new }}
+      vllm_whl: ${{ steps.detect.outputs.vllm_whl }}
+      vllm_ver: ${{ steps.detect.outputs.vllm_ver }}
+      rocm_stamp: ${{ steps.detect.outputs.rocm_stamp }}
+    steps:
+    - name: Detect new nightly
+      id: detect
+      run: |
+        set -uo pipefail
+        IS_NEW=true
+        if [ "$CHANNEL" = "nightly" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+          NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna
+          WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
+            | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+            | sed 's/%2B/+/g' | sort | tail -1 || true)
+          if [ -n "$WHL" ]; then
+            VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/')
+            STAMP=$(echo "$WHL" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
+            echo "vllm_whl=$WHL"     >> "$GITHUB_OUTPUT"
+            echo "vllm_ver=$VER"     >> "$GITHUB_OUTPUT"
+            echo "rocm_stamp=$STAMP" >> "$GITHUB_OUTPUT"
+            echo "newest nightly wheel: $WHL"
+            # Dedup against the published feed (pass AND fail are recorded there,
+            # so a known-bad nightly is not retried — only a new stamp is).
+            FEED="https://raw.githubusercontent.com/${{ github.repository }}/qualification-data/qualification/index.json"
+            SEEN=$(curl -fsSL "$FEED" 2>/dev/null | VER="$VER" python3 -c 'import sys,json,os; d=json.load(sys.stdin); print("SEEN" if any(b.get("vllm_version")==os.environ["VER"] and b.get("channel")=="nightly" for b in d.get("builds",[])) else "NEW")' 2>/dev/null || echo "NEW")
+            if [ "$SEEN" = "SEEN" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+              IS_NEW=false
+              echo "Already qualified $VER — skipping this run (dispatch with force=true to re-run)."
+            elif [ "$SEEN" = "SEEN" ]; then
+              echo "Already qualified $VER but force=true — re-running anyway."
+            else
+              echo "New nightly $VER — running the pipeline."
+            fi
+          else
+            echo "::warning::no cp313 nightly wheel found; proceeding"
+          fi
+        else
+          echo "channel=$CHANNEL event=${{ github.event_name }} — dedup not applicable; proceeding"
+        fi
+        echo "is_new=$IS_NEW" >> "$GITHUB_OUTPUT"
+
   prepare-matrix:
     runs-on: ubuntu-22.04
     outputs:
@@ -41,8 +112,22 @@ jobs:
         echo "Generated matrix: $matrix_targets"
 
   build-ubuntu:
-    runs-on: ubuntu-22.04
-    needs: prepare-matrix
+    # Any self-hosted Linux box in this repo's runner pool (the dev_lab group).
+    # Just [self-hosted, Linux] — the repo only has access to dev_lab runners, so
+    # this matches a dev_lab Linux box without pinning to a name (box names get
+    # reassigned on re-image, e.g. halo-01 came back as Windows). AMD's
+    # frameworks-nightlies host allowlists these boxes' egress but 403s
+    # GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched from
+    # here. Build needs only network + pip (no GPU); it shares the box with
+    # qualify, which runs after via `needs`.
+    runs-on: [self-hosted, Linux]
+    needs: [prepare-matrix, detect-nightly]
+    # Skip the whole build (and everything downstream) when this nightly has
+    # already been qualified. is_new is always true for PRs and stable.
+    # Also skip on pull_request: this is a heavy multi-target repackage that now
+    # runs on the shared dev_lab GPU pool, so PR pushes must not tie those boxes
+    # up (and qualify/create-release already skip PRs). Runs on dispatch + cron.
+    if: needs.detect-nightly.outputs.is_new == 'true' && github.event_name != 'pull_request'
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
@@ -54,18 +139,26 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Download portable Python 3.12 (python-build-standalone)
+    - name: Download portable Python 3.13 (python-build-standalone)
       run: |
         # Use astral-sh/python-build-standalone for a relocatable Python
         # that works across Linux distros without system Python dependency.
-        PBS_TAG="20250604"
-        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.12.11+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+        # Python 3.13 is required: AMD's official nightly wheels are cp313.
+        PBS_TAG="20260602"
+        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.13.13+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
         echo "Downloading portable Python from $PBS_URL"
-        # Extracts to python/ — move to /opt/vllm so it becomes the release root
-        curl -fsSL "$PBS_URL" | tar -xz -C /opt
-        mv /opt/python /opt/vllm
-        /opt/vllm/bin/python3.12 --version
-        echo "Portable Python installed at /opt/vllm"
+        # Build under the runner's temp dir — no sudo, no shared-box pollution,
+        # and isolated per run (the self-hosted boxes are persistent). VLLM_ROOT
+        # is exported so every later step (and the artifact upload) uses it.
+        ROOT="$RUNNER_TEMP/vllm-build/vllm"
+        rm -rf "$RUNNER_TEMP/vllm-build"
+        mkdir -p "$RUNNER_TEMP/vllm-build"
+        # Extracts to python/ — move to vllm/ so it becomes the release root
+        curl -fsSL "$PBS_URL" | tar -xz -C "$RUNNER_TEMP/vllm-build"
+        mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
+        "$ROOT/bin/python3.13" --version
+        echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
+        echo "Portable Python installed at $ROOT"
 
     - name: Map GPU target to AMD wheel URLs
       id: wheel-urls
@@ -93,55 +186,201 @@ jobs:
     - name: Prepare Python environment
       run: |
         # No venv needed — install packages directly into the standalone Python.
-        /opt/vllm/bin/python3 -m pip install --upgrade pip
-        echo "Python: $(/opt/vllm/bin/python3 --version)"
+        # Pin pip to 24.3.1: it still ships --use-deprecated=legacy-resolver,
+        # which the vLLM install needs. The current resolvelib resolver
+        # RecursionErrors building its result graph on a dependency cycle in
+        # vLLM's closure (resolution.py:_has_route_to_root recurses infinitely,
+        # so no setrecursionlimit saves it); the legacy resolver avoids that path.
+        $VLLM_ROOT/bin/python3 -m pip install "pip==24.3.1"
+        echo "pip: $($VLLM_ROOT/bin/pip --version)"
+        echo "Python: $($VLLM_ROOT/bin/python3 --version)"
 
-    - name: Install PyTorch ROCm from AMD
+    - name: Install vLLM + PyTorch (channel=${{ env.CHANNEL }})
       run: |
-        echo "Installing PyTorch from AMD ROCm wheel index..."
-        /opt/vllm/bin/pip install \
-          --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
-          torch torchvision
-        /opt/vllm/bin/python3 -c "
-        import torch
-        print(f'PyTorch {torch.__version__}')
-        print(f'ROCm built-in: {torch.version.hip is not None}')
-        "
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
+        TORCH_INDEX="${{ steps.wheel-urls.outputs.torch_index }}"
+        VLLM_INDEX="${{ steps.wheel-urls.outputs.vllm_index }}"
 
-    - name: Install vLLM ROCm (official wheel with ROCm native extensions)
-      run: |
-        echo "Installing vLLM from official ROCm wheel index..."
-        /opt/vllm/bin/pip install \
-          --extra-index-url https://wheels.vllm.ai/rocm/ \
-          vllm
-        echo "vLLM installed (import check deferred until after torch reinstall)"
+        # vLLM's dependency graph trips pip's resolvelib resolver into a
+        # RecursionError (a cycle in its closure), on BOTH channels. No pip flag
+        # controls the recursion depth, so run pip via its entrypoint under a
+        # raised limit; combined with --use-deprecated=legacy-resolver below this
+        # is what lets the install complete. (pip pinned to 24.3.1 in Prepare.)
+        pip_deep() {
+          "$VLLM_ROOT/bin/python3" -c 'import sys; sys.setrecursionlimit(20000); from pip._internal.cli.main import main; sys.exit(main(sys.argv[1:]))' "$@"
+        }
 
-    - name: Reinstall AMD PyTorch ROCm (compatible with pip ROCm SDK)
-      run: |
-        echo "Reinstalling AMD torch to match bundled ROCm SDK libraries..."
-        /opt/vllm/bin/pip install --force-reinstall --no-deps \
-          --index-url "${{ steps.wheel-urls.outputs.torch_index }}" \
-          torch
+        if [ "$CHANNEL" = "stable" ]; then
+          # STABLE: AMD's per-card matched set — the OLDER one-build-per-gfx
+          # pattern (vLLM at rocm.frameworks.amd.com/whl/<gfx>/, torch at
+          # repo.amd.com/rocm/whl/<gfx>/), NOT the nightly single-RDNA build.
+          # ROCm 7.13 / torch 2.9.1 — a different code-object generation than the
+          # 7.14 nightly, which is the point of this validation run. Same robust
+          # install technique as nightly (legacy resolver + matched-torchvision
+          # repair), pointed at the stable sources.
+          # Pin the cp313 stable vLLM version (don't curl-discover): rocm.
+          # frameworks.amd.com WAF-403s a raw directory-listing GET from the
+          # runner's IP, but pip's PEP503 index access through --extra-index-url
+          # works. Bump this when AMD publishes a newer stable cp313 wheel at
+          # rocm.frameworks.amd.com/whl/gfx1151/vllm/ .
+          VLLM_VER="${{ github.event.inputs.stable_vllm_ver || '0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513' }}"
+          echo "stable: vLLM==$VLLM_VER"
+          # 1. Matched torch from the stable ROCm index (pulls rocm-sdk-* + triton
+          #    at the rocm7.13.0 ABI). The index carries torch 2.9.1 / 2.10.0 /
+          #    2.11.0 all at +rocm7.13.0; vLLM 0.19.1's own code guards pin it to
+          #    torch 2.9.x (>=2.9.0,<2.10.0), so use 2.9.1. NOTE: even this
+          #    code-correct version currently leaves unresolved c10::*[abi:cxx11]
+          #    symbols (tier0 T0.2) — AMD's stable vLLM wheel was built with a
+          #    different _GLIBCXX_USE_CXX11_ABI than its stable torch. That's an
+          #    upstream ABI skew the gate reports; we do not pin around it.
+          $VLLM_ROOT/bin/pip install --index-url "$TORCH_INDEX" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torch==2.9.1+rocm7.13.0"
+          # 2. vLLM by version from the gfx index + PyPI for the ~70 normal deps.
+          #    Same legacy resolver as nightly (the recursion cycle is in vLLM's
+          #    graph regardless of channel); --ignore-requires-python guards any
+          #    amd-quark cp<3.13 cap.
+          ok=0
+          for attempt in 1 2 3; do
+            if pip_deep install --use-deprecated=legacy-resolver --ignore-requires-python \
+                 --extra-index-url "$VLLM_INDEX" \
+                 --extra-index-url "$TORCH_INDEX" \
+                 --extra-index-url https://pypi.org/simple/ \
+                 "vllm==$VLLM_VER"; then ok=1; break; fi
+            echo "::warning::stable vLLM install attempt $attempt failed; retry in $((attempt*10))s"
+            sleep $((attempt * 10))
+          done
+          [ "$ok" = 1 ] || { echo "::error::stable vLLM install failed after 3 attempts"; exit 1; }
+          # 3. Repair: the legacy resolver may have pulled a PyPI torchvision with
+          #    the wrong torch ABI (torchvision::nms unregistered -> import dies).
+          #    Force the matched ROCm build AFTER vLLM. pycountry is an undeclared
+          #    optional transitive (mistral_common). pip check surfaces the rest.
+          $VLLM_ROOT/bin/pip install --index-url "$TORCH_INDEX" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torchvision==0.24.0+rocm7.13.0"
+          $VLLM_ROOT/bin/pip install pycountry
+          $VLLM_ROOT/bin/pip check || echo "::warning::pip check reported conflicts (see above); qualify will gate"
+        else
+          # NIGHTLY: repackage AMD's OFFICIAL nightly. AMD publishes a single
+          # universal RDNA vLLM wheel plus a date-stamped matched torch; we pair
+          # them by the shared ROCm build stamp (rocm7.14.0a<DATE>), so the set
+          # is ABI-consistent by construction — no pinning around mismatches.
+          NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna
+          NIGHTLY_TORCH=https://rocm.nightlies.amd.com/whl-multi-arch
+          # torch's per-gfx kernels are an extra; map the matrix target to it.
+          case "${{ matrix.gfx_target }}" in
+            gfx1151) DEV=gfx1151 ;;
+            gfx1150) DEV=gfx1150 ;;
+            gfx110X) DEV=gfx1100 ;;
+            gfx120X) DEV=gfx1200 ;;
+            *) DEV="${{ matrix.gfx_target }}" ;;
+          esac
+          # 1. Use the version detect-nightly already resolved (so detect and
+          #    build agree even if AMD publishes a newer one mid-run); else
+          #    discover the newest cp313 wheel from the index.
+          VLLM_VER="${{ needs.detect-nightly.outputs.vllm_ver }}"
+          ROCM_STAMP="${{ needs.detect-nightly.outputs.rocm_stamp }}"
+          if [ -z "$VLLM_VER" ]; then
+            WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
+              | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+              | sort | tail -1)
+            VLLM_VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/' | sed 's/%2B/+/g')
+            ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
+          fi
+          [ -n "$VLLM_VER" ] || { echo "::error::no cp313 nightly vLLM version found"; exit 1; }
+          # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
+          # bump TORCH_VER here when vLLM bumps its torch requirement.
+          TORCH_VER=2.11.0
+          echo "nightly: vLLM==$VLLM_VER"
+          echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
+          # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
+          #    all resolved at the same ROCm stamp from one index.
+          $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torch[device-${DEV}]==${TORCH_VER}+${ROCM_STAMP}"
+          # 3a. Pre-install amd-quark. vLLM pins amd-quark>=0.8.99, but every
+          #    amd-quark >=0.7 on PyPI caps Requires-Python at <3.13 while our
+          #    bundle is cp313. amd-quark is a pure-Python (py3-none-any) wheel —
+          #    the cap is a conservative untested-version guard, not a real ABI
+          #    limit — so install it ALONE with --ignore-requires-python (a tiny
+          #    candidate space). Scoping the flag here, not on the vLLM resolve,
+          #    is deliberate: passed globally it strips the Python filter from
+          #    every dep, ballooning pip's backtracking until it RecursionErrors.
+          #    Once installed and satisfying >=0.8.99, vLLM's resolve accepts it.
+          pip_deep install --ignore-requires-python "amd-quark>=0.8.99"
+          # 3b. The universal vLLM wheel + flash-attn (AMD index) + the rest from
+          #    PyPI. Install BY VERSION through the index (not a hand-built wheel
+          #    URL): the host serves the wheel only at its %2B-encoded path, so a
+          #    direct URL with a literal '+' gets WAF-403'd. Letting pip resolve
+          #    the index href fetches the correctly-encoded URL. vLLM declares no
+          #    torch dep, so the matched torch above is untouched.
+          #    Two flags, both required and complementary:
+          #    --use-deprecated=legacy-resolver: the new resolvelib resolver
+          #    RecursionErrors building its result graph on a cycle in vLLM's
+          #    dependency closure (resolution.py:_has_route_to_root recurses
+          #    without end). The legacy resolver doesn't walk that graph. (pip is
+          #    pinned to 24.3.1 above so this flag still exists.)
+          #    --ignore-requires-python: the legacy resolver re-checks
+          #    requires-python on the already-installed amd-quark (0.11.2, capped
+          #    <3.13) and hard-errors on cp313; the flag makes it accept it. On
+          #    the legacy (first-found, no-backtrack) resolver this can't balloon
+          #    the candidate search the way it would on the new resolver.
+          ok=0
+          for attempt in 1 2 3; do
+            if pip_deep install --use-deprecated=legacy-resolver --ignore-requires-python \
+                 --extra-index-url "$NIGHTLY_VLLM" \
+                 --extra-index-url https://pypi.org/simple/ \
+                 "vllm==$VLLM_VER"; then ok=1; break; fi
+            echo "::warning::vLLM install attempt $attempt failed; retry in $((attempt*10))s"
+            sleep $((attempt * 10))
+          done
+          [ "$ok" = 1 ] || { echo "::error::vLLM install failed after 3 attempts"; exit 1; }
+          # 3c. Repair legacy-resolver over-picks. The legacy resolver takes the
+          #    first-found version and ignores transitive UPPER bounds / ABI, so
+          #    it leaves deps that break vLLM at import (each caught by qualify
+          #    T1.5). Re-assert the correct ones here (small single-package
+          #    resolves — no cycle), then `pip check` surfaces any remaining
+          #    mis-pick in the build log without failing the build (qualify gates).
+          #
+          #    torchvision must match the ROCm torch ABI or its C++ ops
+          #    (torchvision::nms) fail to register and `import vllm` dies. Legacy
+          #    pulled a PyPI torchvision built against a different torch; force the
+          #    matched ROCm build from the nightly index, same rocm stamp. torch
+          #    2.11 pairs with torchvision 0.26 — bump TV_VER with TORCH_VER.
+          TV_VER=0.26.0
+          $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
+            --extra-index-url https://pypi.org/simple/ \
+            "torchvision==${TV_VER}+${ROCM_STAMP}"
+          #    transformers needs tokenizers>=0.22.0,<=0.23.0 but legacy pulled
+          #    0.23.1, raising ImportError at import; pin it back into range.
+          $VLLM_ROOT/bin/pip install "tokenizers>=0.22.0,<=0.23.0"
+          #    pycountry: an OPTIONAL transitive nothing declares as a hard dep
+          #    (vLLM -> mistral_common -> pydantic_extra_types.language_code ->
+          #    pycountry), so no resolver installs it, yet mistral_common imports
+          #    it at module load and vllm-server dies without it. Add explicitly.
+          $VLLM_ROOT/bin/pip install pycountry
+          $VLLM_ROOT/bin/pip check || echo "::warning::pip check reported dependency conflicts (see above); qualify will gate"
+        fi
 
-        # Remove the vLLM-bundled amdsmi (v26.2.2 from ROCm 7.2.1) —
-        # it conflicts with the AMD pip ROCm SDK amdsmi (v26.3.0).
-        # The ROCm SDK version in _rocm_sdk_core/share/amd_smi/ is used instead.
-        SP="/opt/vllm/lib/python3.12/site-packages"
+        # Use the AMD pip ROCm SDK amdsmi (_rocm_sdk_core/share/amd_smi) rather
+        # than any amdsmi the wheels bundled.
         rm -rf $SP/amdsmi $SP/amdsmi-*.dist-info
 
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
-        /opt/vllm/bin/python3 -c "
+        # Report versions but DO NOT fail the build on a bad combination — a
+        # broken bundle must still be packaged so the qualification gate can
+        # detect and REPORT it. Fixing upstream is never our job.
+        $VLLM_ROOT/bin/python3 -c "
         import torch; print(f'PyTorch {torch.__version__}')
         import vllm; print(f'vLLM {vllm.__version__}')
-        print('Both imports OK')
-        "
+        " || echo "WARNING: import check failed — qualification will report this"
 
     - name: Pre-compile Triton HIP utilities (eliminates gcc dependency)
       run: |
-        SP="/opt/vllm/lib/python3.12/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         TRITON_AMD="$SP/triton/backends/amd"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
@@ -161,10 +400,10 @@ jobs:
         # We can't use Triton's compile_module_from_src because it also tries to
         # dlopen the HIP library, which doesn't work on headless CI.
         TRITON_AMD="$SP/triton/backends/amd"
-        PYTHON_INC="/opt/vllm/include/python3.12"
+        PYTHON_INC="$VLLM_ROOT/include/python3.13"
 
         # Generate the C source with the HIP library path baked in
-        /opt/vllm/bin/python3 -c "
+        $VLLM_ROOT/bin/python3 -c "
         from pathlib import Path
         import os
         dirname = '$TRITON_AMD'
@@ -185,15 +424,15 @@ jobs:
         # Patch Triton to load the pre-built .so instead of JIT-compiling
         DRIVER_PY="$TRITON_AMD/driver.py"
         sed -i 's|mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)|_pso = os.path.join(dirname, "hip_utils_prebuilt.so")\n        if os.path.exists(_pso):\n            import importlib.util as _ilu\n            _sp = _ilu.spec_from_file_location("hip_utils", _pso)\n            mod = _ilu.module_from_spec(_sp)\n            _sp.loader.exec_module(mod)\n        else:\n            mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)|' "$DRIVER_PY"
-        /opt/vllm/bin/python3 -c "import ast; ast.parse(open('$DRIVER_PY').read()); print('Patched driver.py — syntax OK')"
+        $VLLM_ROOT/bin/python3 -c "import ast; ast.parse(open('$DRIVER_PY').read()); print('Patched driver.py — syntax OK')"
 
     - name: Create launcher script
       run: |
-        cat > /opt/vllm/bin/vllm-server << 'LAUNCHER_EOF'
+        cat > $VLLM_ROOT/bin/vllm-server << 'LAUNCHER_EOF'
         #!/bin/bash
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         VENV_DIR="$(dirname "$SCRIPT_DIR")"
-        SP="$VENV_DIR/lib/python3.12/site-packages"
+        SP="$VENV_DIR/lib/python3.13/site-packages"
         # Add all bundled ROCm library paths
         for libdir in "$SP"/_rocm_sdk_*/lib "$SP"/torch/lib; do
         [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
@@ -205,24 +444,24 @@ jobs:
         export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
         # Use bundled clang for Triton JIT (no system gcc needed)
         CLANG="$SP/_rocm_sdk_core/lib/llvm/bin/clang"
-        [ -f "$CLANG" ] && chmod +x "$CLANG" "$CLANG"-22 2>/dev/null
+        [ -f "$CLANG" ] && chmod +x "$CLANG" "$CLANG"-* 2>/dev/null
         export CC="$CLANG"
         exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
         # Remove YAML indentation from heredoc
-        sed -i 's/^        //' /opt/vllm/bin/vllm-server
-        chmod +x /opt/vllm/bin/vllm-server
+        sed -i 's/^        //' $VLLM_ROOT/bin/vllm-server
+        chmod +x $VLLM_ROOT/bin/vllm-server
         echo "Launcher script:"
-        cat /opt/vllm/bin/vllm-server
+        cat $VLLM_ROOT/bin/vllm-server
 
     - name: Strip unnecessary files to reduce size
       run: |
-        cd /opt/vllm
+        cd $VLLM_ROOT
         echo "=== Size before cleanup ==="
         du -sh .
 
-        SP="lib/python3.12/site-packages"
+        SP="lib/python3.13/site-packages"
 
         # Remove pip/wheel (keep setuptools — torch.utils.cpp_extension needs it)
         rm -rf $SP/pip* $SP/wheel* 2>/dev/null || true
@@ -245,22 +484,25 @@ jobs:
 
         # Trim LLVM toolchain: keep only clang + its libs (~350MB saved)
         LLVM="$SP/_rocm_sdk_core/lib/llvm"
-        # Keep only clang, clang-22, remove everything else from bin/
-        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-22" -delete 2>/dev/null || true
+        # Keep the clang driver and its versioned binary (clang-NN). The LLVM
+        # major tracks the ROCm release (clang-22 on 7.13, clang-23 on 7.14);
+        # hardcoding clang-22 would delete the real compiler on newer ROCm and
+        # break Triton's runtime JIT. Match clang-* so it survives any version.
+        find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-*" -delete 2>/dev/null || true
         find "$LLVM/bin" -type l ! -name "clang" -delete 2>/dev/null || true
         # Keep only libs that clang needs (libclang-cpp, libLLVM, rocm_sysdeps)
         find "$LLVM/lib" -name "*.so*" \
           ! -name "libclang-cpp*" \
           ! -name "libLLVM*" \
           -delete 2>/dev/null || true
-        rm -rf "$LLVM/lib/clang/22/include/cuda_wrappers" 2>/dev/null || true
+        rm -rf "$LLVM/lib/clang/"*/include/cuda_wrappers 2>/dev/null || true
 
         # Trim ROCm SDK bin/ (Python wrapper scripts, not needed)
         rm -rf "$SP/_rocm_sdk_core/bin" 2>/dev/null || true
 
         # Remove Python stdlib we don't need
-        rm -rf lib/python3.12/test lib/python3.12/tkinter lib/python3.12/idlelib 2>/dev/null || true
-        rm -rf lib/python3.12/turtledemo lib/python3.12/ensurepip 2>/dev/null || true
+        rm -rf lib/python3.13/test lib/python3.13/tkinter lib/python3.13/idlelib 2>/dev/null || true
+        rm -rf lib/python3.13/turtledemo lib/python3.13/ensurepip 2>/dev/null || true
         # Keep include/ — Triton JIT needs Python.h headers
 
         # Ensure bundled clang is executable (permissions lost during tar)
@@ -277,15 +519,15 @@ jobs:
 
     - name: Verify bundled environment works
       run: |
-        SP="/opt/vllm/lib/python3.12/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
 
-        /opt/vllm/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} OK')"
-        /opt/vllm/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__} OK')"
-        /opt/vllm/bin/python3 -c "
+        $VLLM_ROOT/bin/python3 -c "import vllm; print(f'vLLM {vllm.__version__} OK')"
+        $VLLM_ROOT/bin/python3 -c "import torch; print(f'PyTorch {torch.__version__} OK')"
+        $VLLM_ROOT/bin/python3 -c "
         # Verify native extensions exist (they load only with GPU present)
         import os, pathlib
         sp = pathlib.Path('$SP/vllm')
@@ -295,51 +537,54 @@ jobs:
             print(f'{ext}: {p.stat().st_size // 1048576} MB')
         print('Native extensions verified')
         "
-        bash -n /opt/vllm/bin/vllm-server
+        bash -n $VLLM_ROOT/bin/vllm-server
         echo "All sanity checks passed"
 
     - name: Report final size
       run: |
         echo "=== Final artifact ==="
-        du -sh /opt/vllm/
+        du -sh $VLLM_ROOT/
         echo ""
-        du -sh /opt/vllm/*/ 2>/dev/null
+        du -sh $VLLM_ROOT/*/ 2>/dev/null
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: /opt/vllm/
+        path: ${{ env.VLLM_ROOT }}/
         retention-days: 30
         compression-level: 6
 
     - name: Set job outputs
       id: set-outputs
       run: |
-        SP="/opt/vllm/lib/python3.12/site-packages"
+        SP="$VLLM_ROOT/lib/python3.13/site-packages"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
         export LD_LIBRARY_PATH
 
-        vllm_ver=$(/opt/vllm/bin/python3 -c "import vllm; print(vllm.__version__)")
-        torch_ver=$(/opt/vllm/bin/python3 -c "import torch; print(torch.__version__)")
+        vllm_ver=$($VLLM_ROOT/bin/python3 -c "import vllm; print(vllm.__version__)")
+        torch_ver=$($VLLM_ROOT/bin/python3 -c "import torch; print(torch.__version__)")
         echo "vllm_version=$vllm_ver" >> $GITHUB_OUTPUT
         echo "torch_version=$torch_ver" >> $GITHUB_OUTPUT
 
     - name: Clean up
       if: always()
       run: |
-        [ -d "/opt/vllm" ] && sudo rm -rf /opt/vllm
+        # No sudo — it's under the runner's temp dir. Free the box for the next run.
+        rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 15-test qualification on the self-hosted dev_lab box (ta-devlab-halo-02, 200 GB).
+  # 15-test qualification on a self-hosted dev_lab Linux gfx1151 box. Targets just
+  # [self-hosted, Linux] — the repo's only runners are the dev_lab pool, so this
+  # matches whichever dev_lab Linux box is online without pinning to a name.
   # Runs the scripts/qualify harness against the built bundle:
   #   tier0 static (5) + tier1 hardware smoke (5) + tier2 functional inference (5)
   # = 15 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on: [self-hosted, Linux, ta-devlab-halo-02]
+    runs-on: [self-hosted, Linux]
     env:
       GFX: gfx1151
     # Only on release builds. Skips PRs, dispatches with create_release=false,
@@ -419,7 +664,7 @@ jobs:
         # upload-artifact drops the +x bit and the unversioned .so symlinks the
         # build created, so rebuild both before running the harness.
         ROOT="${{ runner.temp }}/vllm-qual/vllm"
-        SP="$ROOT/lib/python3.12/site-packages"
+        SP="$ROOT/lib/python3.13/site-packages"
         chmod +x "$ROOT/bin/"* 2>/dev/null || true
         chmod +x "$SP/_rocm_sdk_core/lib/llvm/bin/"clang* 2>/dev/null || true
         ROCM_LIB="$SP/_rocm_sdk_core/lib"
@@ -446,25 +691,25 @@ jobs:
         # emit a JSON fragment even when one fails; `aggregate --fail-on-no-promote`
         # is the single gate that decides pass/fail for the whole job.
         echo "::group::Tier 0 — static bundle verification (T0.1–T0.6)"
-        "$PY" "$Q/tier0_static.pyc"   --bundle-root "$ROOT" --gfx-target "$GFX" \
-            --channel stable --candidate-tag "$TAG" --output "$FRAG/tier0-report.json" || true
+        "$PY" "$Q/tier0_static.py"   --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" --output "$FRAG/tier0-report.json" || true
         echo "::endgroup::"
 
         echo "::group::Tier 1 — hardware smoke (T1.1–T1.5)"
-        "$PY" "$Q/tier1_smoke.pyc"    --bundle-root "$ROOT" --gfx-target "$GFX" \
-            --channel stable --candidate-tag "$TAG" --output "$FRAG/tier1-report.json" || true
+        "$PY" "$Q/tier1_smoke.py"    --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" --output "$FRAG/tier1-report.json" || true
         echo "::endgroup::"
 
         echo "::group::Tier 2 — functional inference (T2.1–T2.5)"
-        "$PY" "$Q/tier2_inference.pyc" --bundle-root "$ROOT" --gfx-target "$GFX" \
-            --channel stable --candidate-tag "$TAG" \
+        "$PY" "$Q/tier2_inference.py" --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" \
             --model Qwen/Qwen2.5-0.5B-Instruct --logs-dir "$FRAG" \
             --output "$FRAG/tier2-report.json" || true
         echo "::endgroup::"
 
         echo "=== Aggregate fragments → qualification report (gates the job) ==="
-        "$PY" "$Q/aggregate.pyc" --fragments-dir "$FRAG" --gfx-target "$GFX" \
-            --channel stable --candidate-tag "$TAG" \
+        "$PY" "$Q/aggregate.py" --fragments-dir "$FRAG" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" \
             --require-tiers tier0,tier1,tier2 --hardware-validated \
             --output "$FRAG/qualification-report.json" \
             --fail-on-no-promote
@@ -496,6 +741,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      # Optional. When set, the summary's prose is polished by an LLM pass;
+      # absent, the deterministic summary (written by aggregate) is published.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
     - name: Checkout repository (for the publish script + schema doc)
       uses: actions/checkout@v4
@@ -507,6 +756,20 @@ jobs:
       with:
         name: qualification-gfx1151
         path: report
+
+    - name: Enrich summary prose (optional, best-effort)
+      # Only when the key is configured. The deterministic summary is already
+      # in the report; this rewrites only its prose and never fails the job.
+      if: env.ANTHROPIC_API_KEY != ''
+      run: |
+        if [ ! -f report/qualification-report.json ]; then
+          echo "no report to enrich"; exit 0
+        fi
+        python3 -m pip install --quiet --disable-pip-version-check anthropic \
+          || { echo "::warning::pip install anthropic failed; skipping enrichment"; exit 0; }
+        python3 repo/scripts/qualify/enrich_summary.py \
+          --report report/qualification-report.json \
+          --model claude-haiku-4-5 || true
 
     - name: Publish to qualification-data branch
       env:

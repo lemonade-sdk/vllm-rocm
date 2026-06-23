@@ -78,8 +78,24 @@ def build_entry(report, run_url):
         "qualified": bool(report.get("promoted")),
         "overall": report.get("overall"),
         "blocked_by": report.get("promotion", {}).get("blocked_by", []),
+        # Compact "why blocked?" card. Full root_causes live in the per-build
+        # report (report_url); the index stays small for the dashboard poll.
+        "summary": _compact_summary(report.get("summary")),
         "results": results,
         "report_url": f"reports/{b.get('build_id')}.json",
+    }
+
+
+def _compact_summary(summary):
+    """Index-sized slice of the report's summary block (title + action +
+    blocking tests). Returns None when no summary is present."""
+    if not summary:
+        return None
+    return {
+        "title": summary.get("title"),
+        "recommended_action": summary.get("recommended_action"),
+        "blocking_tests": summary.get("blocking_tests", []),
+        "source": summary.get("source"),
     }
 
 
