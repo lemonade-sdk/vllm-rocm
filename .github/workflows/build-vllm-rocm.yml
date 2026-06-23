@@ -108,12 +108,15 @@ jobs:
         echo "Generated matrix: $matrix_targets"
 
   build-ubuntu:
-    # Self-hosted dev_lab pool (ta-devlab-halo-01/02/03), same `ubuntu` label as
-    # qualify. AMD's frameworks-nightlies host allowlists these boxes' egress but
-    # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
-    # from here. Build needs only network + pip (no GPU); it shares the pool with
-    # qualify, which runs after it via `needs`.
-    runs-on: [self-hosted, Linux, ubuntu]
+    # Any self-hosted Linux box in this repo's runner pool (the dev_lab group).
+    # Just [self-hosted, Linux] — the repo only has access to dev_lab runners, so
+    # this matches a dev_lab Linux box without pinning to a name (box names get
+    # reassigned on re-image, e.g. halo-01 came back as Windows). AMD's
+    # frameworks-nightlies host allowlists these boxes' egress but 403s
+    # GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched from
+    # here. Build needs only network + pip (no GPU); it shares the box with
+    # qualify, which runs after via `needs`.
+    runs-on: [self-hosted, Linux]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream) when this nightly has
     # already been qualified. is_new is always true for PRs and stable.
@@ -562,16 +565,16 @@ jobs:
         # No sudo — it's under the runner's temp dir. Free the box for the next run.
         rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 15-test qualification on a self-hosted dev_lab gfx1151 box. Targets the
-  # shared `ubuntu` label (the dev_lab pool: ta-devlab-halo-01/02/03) so it runs
-  # on whichever box is online rather than pinning to one. Runs the
-  # scripts/qualify harness against the built bundle:
+  # 15-test qualification on a self-hosted dev_lab Linux gfx1151 box. Targets just
+  # [self-hosted, Linux] — the repo's only runners are the dev_lab pool, so this
+  # matches whichever dev_lab Linux box is online without pinning to a name.
+  # Runs the scripts/qualify harness against the built bundle:
   #   tier0 static (5) + tier1 hardware smoke (5) + tier2 functional inference (5)
   # = 15 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on: [self-hosted, Linux, ubuntu]
+    runs-on: [self-hosted, Linux]
     env:
       GFX: gfx1151
     # Only on release builds. Skips PRs, dispatches with create_release=false,
