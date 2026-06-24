@@ -1,7 +1,57 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-06-23T19:37:27Z",
+  "updated_at": "2026-06-24T00:23:04Z",
   "builds": [
+    {
+      "build_id": "28061756450-gfx1151-nightly",
+      "tag": "vllm0.23.1.dev0+rocm7.14.0a20260622.g0fc695fc6.d20260623-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "nightly",
+      "generated_at": "2026-06-24T00:23:04Z",
+      "run_id": "28061756450",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/28061756450",
+      "vllm_version": "0.23.1.dev0+rocm7.14.0a20260622.g0fc695fc6.d20260623",
+      "torch_version": "2.11.0+rocm7.14.0a20260622",
+      "rocm_version": "7.14.0",
+      "tests": {
+        "passed": 9,
+        "failed": 5,
+        "warned": 1,
+        "skipped": 0,
+        "total": 15
+      },
+      "qualified": false,
+      "overall": "warn",
+      "blocked_by": [
+        "tier0=warn",
+        "tier2 missing"
+      ],
+      "summary": {
+        "title": "Torch version metadata missing in tier0",
+        "recommended_action": "Verify vLLM 0.23.1.dev0+rocm7.14.0a20260622 metadata contains torch version pinning; rebuild or check package configuration if metadata is missing or malformed.",
+        "blocking_tests": [],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "warn",
+        "T0.2": "pass",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "pass",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "pass",
+        "T2.1": "missing",
+        "T2.2": "missing",
+        "T2.3": "missing",
+        "T2.4": "missing",
+        "T2.5": "missing"
+      },
+      "report_url": "reports/28061756450-gfx1151-nightly.json"
+    },
     {
       "build_id": "28051380354-gfx1151-stable",
       "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
