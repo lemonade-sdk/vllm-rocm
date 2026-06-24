@@ -63,11 +63,12 @@ jobs:
         IS_NEW=true
         if [ "$CHANNEL" = "nightly" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
           NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna
+          # AMD's nightly vLLM is cp314 (Python 3.14); the old cp313 line is frozen.
           WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
-            | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+            | grep -oE 'vllm-[0-9][^"]*-cp314-cp314-linux_x86_64\.whl' \
             | sed 's/%2B/+/g' | sort | tail -1 || true)
           if [ -n "$WHL" ]; then
-            VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/')
+            VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp314-cp314-linux_x86_64\.whl$/\1/')
             STAMP=$(echo "$WHL" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
             echo "vllm_whl=$WHL"     >> "$GITHUB_OUTPUT"
             echo "vllm_ver=$VER"     >> "$GITHUB_OUTPUT"
@@ -86,7 +87,7 @@ jobs:
               echo "New nightly $VER — running the pipeline."
             fi
           else
-            echo "::warning::no cp313 nightly wheel found; proceeding"
+            echo "::warning::no cp314 nightly wheel found; proceeding"
           fi
         else
           echo "channel=$CHANNEL event=${{ github.event_name }} — dedup not applicable; proceeding"
@@ -139,13 +140,22 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Download portable Python 3.13 (python-build-standalone)
+    - name: Download portable Python (python-build-standalone)
       run: |
-        # Use astral-sh/python-build-standalone for a relocatable Python
-        # that works across Linux distros without system Python dependency.
-        # Python 3.13 is required: AMD's official nightly wheels are cp313.
-        PBS_TAG="20260602"
-        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.13.13+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+        # Relocatable Python from astral-sh/python-build-standalone — no system
+        # Python/ROCm dependency. The Python version is CHANNEL-DRIVEN because the
+        # two channels' vLLM wheels target different CPython ABIs:
+        #   nightly -> cp314 (AMD's device-all-rdna nightly moved to Python 3.14)
+        #   stable  -> cp313 (AMD's per-gfx stable vLLM is still cp313)
+        # PYVER is exported so every later build step uses the right lib/ path,
+        # and qualify re-derives it from the bundle.
+        if [ "$CHANNEL" = "stable" ]; then
+          PYVER=3.13; PBS_TAG=20260602; PBS_PY=3.13.13
+        else
+          PYVER=3.14; PBS_TAG=20260623; PBS_PY=3.14.6
+        fi
+        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${PBS_PY}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+        echo "channel=$CHANNEL -> Python $PBS_PY (cp${PYVER/./})"
         echo "Downloading portable Python from $PBS_URL"
         # Build under the runner's temp dir — no sudo, no shared-box pollution,
         # and isolated per run (the self-hosted boxes are persistent). VLLM_ROOT
@@ -156,8 +166,9 @@ jobs:
         # Extracts to python/ — move to vllm/ so it becomes the release root
         curl -fsSL "$PBS_URL" | tar -xz -C "$RUNNER_TEMP/vllm-build"
         mv "$RUNNER_TEMP/vllm-build/python" "$ROOT"
-        "$ROOT/bin/python3.13" --version
+        "$ROOT/bin/python${PYVER}" --version
         echo "VLLM_ROOT=$ROOT" >> "$GITHUB_ENV"
+        echo "PYVER=$PYVER" >> "$GITHUB_ENV"
         echo "Portable Python installed at $ROOT"
 
     - name: Map GPU target to AMD wheel URLs
@@ -197,9 +208,21 @@ jobs:
 
     - name: Install vLLM + PyTorch (channel=${{ env.CHANNEL }})
       run: |
-        SP="$VLLM_ROOT/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
         TORCH_INDEX="${{ steps.wheel-urls.outputs.torch_index }}"
         VLLM_INDEX="${{ steps.wheel-urls.outputs.vllm_index }}"
+
+        # Steer any CMake-based source build (notably onnx, pulled by amd-quark)
+        # at our bundled Python. On cp314/x86_64 some deps have no wheel yet —
+        # onnx 1.19.0 (amd-quark caps onnx<=1.19.0) only ships a cp314 *aarch64*
+        # wheel, so x86_64 falls back to the sdist. onnx's CMake find_package
+        # (Python3) / pybind11 otherwise resolve the box's system python (3.12)
+        # off PATH and emit a cpython-312 ext that pip (running 3.14) can't use.
+        # Putting the bundled interpreter FIRST on PATH makes CMake find 3.14 and
+        # build a cpython-${PYVER} ext (the -D hints alone aren't honored). No-op
+        # when a wheel is used (e.g. stable cp313).
+        export PATH="$VLLM_ROOT/bin:$PATH"
+        export CMAKE_ARGS="${CMAKE_ARGS:-} -DPython3_EXECUTABLE=$VLLM_ROOT/bin/python3 -DPython_EXECUTABLE=$VLLM_ROOT/bin/python3"
 
         # vLLM's dependency graph trips pip's resolvelib resolver into a
         # RecursionError (a cycle in its closure), on BOTH channels. No pip flag
@@ -277,17 +300,17 @@ jobs:
           esac
           # 1. Use the version detect-nightly already resolved (so detect and
           #    build agree even if AMD publishes a newer one mid-run); else
-          #    discover the newest cp313 wheel from the index.
+          #    discover the newest cp314 wheel from the index.
           VLLM_VER="${{ needs.detect-nightly.outputs.vllm_ver }}"
           ROCM_STAMP="${{ needs.detect-nightly.outputs.rocm_stamp }}"
           if [ -z "$VLLM_VER" ]; then
             WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
-              | grep -oE 'vllm-[0-9][^"]*-cp313-cp313-linux_x86_64\.whl' \
+              | grep -oE 'vllm-[0-9][^"]*-cp314-cp314-linux_x86_64\.whl' \
               | sort | tail -1)
-            VLLM_VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp313-cp313-linux_x86_64\.whl$/\1/' | sed 's/%2B/+/g')
+            VLLM_VER=$(echo "$WHL" | sed -E 's/^vllm-(.*)-cp314-cp314-linux_x86_64\.whl$/\1/' | sed 's/%2B/+/g')
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
           fi
-          [ -n "$VLLM_VER" ] || { echo "::error::no cp313 nightly vLLM version found"; exit 1; }
+          [ -n "$VLLM_VER" ] || { echo "::error::no cp314 nightly vLLM version found"; exit 1; }
           # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
           # bump TORCH_VER here when vLLM bumps its torch requirement.
           TORCH_VER=2.11.0
@@ -300,7 +323,7 @@ jobs:
             "torch[device-${DEV}]==${TORCH_VER}+${ROCM_STAMP}"
           # 3a. Pre-install amd-quark. vLLM pins amd-quark>=0.8.99, but every
           #    amd-quark >=0.7 on PyPI caps Requires-Python at <3.13 while our
-          #    bundle is cp313. amd-quark is a pure-Python (py3-none-any) wheel —
+          #    nightly bundle is cp314. amd-quark is a pure-Python (py3-none-any) wheel —
           #    the cap is a conservative untested-version guard, not a real ABI
           #    limit — so install it ALONE with --ignore-requires-python (a tiny
           #    candidate space). Scoping the flag here, not on the vLLM resolve,
@@ -321,8 +344,8 @@ jobs:
           #    without end). The legacy resolver doesn't walk that graph. (pip is
           #    pinned to 24.3.1 above so this flag still exists.)
           #    --ignore-requires-python: the legacy resolver re-checks
-          #    requires-python on the already-installed amd-quark (0.11.2, capped
-          #    <3.13) and hard-errors on cp313; the flag makes it accept it. On
+          #    requires-python on the already-installed amd-quark (capped <3.13)
+          #    and hard-errors on cp314; the flag makes it accept it. On
           #    the legacy (first-found, no-backtrack) resolver this can't balloon
           #    the candidate search the way it would on the new resolver.
           ok=0
@@ -380,7 +403,7 @@ jobs:
 
     - name: Pre-compile Triton HIP utilities (eliminates gcc dependency)
       run: |
-        SP="$VLLM_ROOT/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
         TRITON_AMD="$SP/triton/backends/amd"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
@@ -400,7 +423,7 @@ jobs:
         # We can't use Triton's compile_module_from_src because it also tries to
         # dlopen the HIP library, which doesn't work on headless CI.
         TRITON_AMD="$SP/triton/backends/amd"
-        PYTHON_INC="$VLLM_ROOT/include/python3.13"
+        PYTHON_INC="$VLLM_ROOT/include/python${PYVER}"
 
         # Generate the C source with the HIP library path baked in
         $VLLM_ROOT/bin/python3 -c "
@@ -432,7 +455,9 @@ jobs:
         #!/bin/bash
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         VENV_DIR="$(dirname "$SCRIPT_DIR")"
-        SP="$VENV_DIR/lib/python3.13/site-packages"
+        # Glob the bundled python3.* dir so the launcher is Python-version-agnostic
+        # (the bundle is cp313 or cp314 depending on channel).
+        SP="$(echo "$VENV_DIR"/lib/python3.*/site-packages)"
         # Add all bundled ROCm library paths
         for libdir in "$SP"/_rocm_sdk_*/lib "$SP"/torch/lib; do
         [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
@@ -461,7 +486,7 @@ jobs:
         echo "=== Size before cleanup ==="
         du -sh .
 
-        SP="lib/python3.13/site-packages"
+        SP="lib/python${PYVER}/site-packages"
 
         # Remove pip/wheel (keep setuptools — torch.utils.cpp_extension needs it)
         rm -rf $SP/pip* $SP/wheel* 2>/dev/null || true
@@ -501,8 +526,8 @@ jobs:
         rm -rf "$SP/_rocm_sdk_core/bin" 2>/dev/null || true
 
         # Remove Python stdlib we don't need
-        rm -rf lib/python3.13/test lib/python3.13/tkinter lib/python3.13/idlelib 2>/dev/null || true
-        rm -rf lib/python3.13/turtledemo lib/python3.13/ensurepip 2>/dev/null || true
+        rm -rf lib/python${PYVER}/test lib/python${PYVER}/tkinter lib/python${PYVER}/idlelib 2>/dev/null || true
+        rm -rf lib/python${PYVER}/turtledemo lib/python${PYVER}/ensurepip 2>/dev/null || true
         # Keep include/ — Triton JIT needs Python.h headers
 
         # Ensure bundled clang is executable (permissions lost during tar)
@@ -519,7 +544,7 @@ jobs:
 
     - name: Verify bundled environment works
       run: |
-        SP="$VLLM_ROOT/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
@@ -558,7 +583,7 @@ jobs:
     - name: Set job outputs
       id: set-outputs
       run: |
-        SP="$VLLM_ROOT/lib/python3.13/site-packages"
+        SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
         for libdir in $SP/_rocm_sdk_*/lib $SP/torch/lib; do
           [ -d "$libdir" ] && LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
         done
@@ -664,7 +689,9 @@ jobs:
         # upload-artifact drops the +x bit and the unversioned .so symlinks the
         # build created, so rebuild both before running the harness.
         ROOT="${{ runner.temp }}/vllm-qual/vllm"
-        SP="$ROOT/lib/python3.13/site-packages"
+        # The bundle's Python version is channel-dependent (cp313 stable / cp314
+        # nightly); glob it rather than hardcode.
+        SP="$(echo "$ROOT"/lib/python3.*/site-packages)"
         chmod +x "$ROOT/bin/"* 2>/dev/null || true
         chmod +x "$SP/_rocm_sdk_core/lib/llvm/bin/"clang* 2>/dev/null || true
         ROCM_LIB="$SP/_rocm_sdk_core/lib"
