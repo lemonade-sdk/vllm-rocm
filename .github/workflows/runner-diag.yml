@@ -27,25 +27,34 @@ jobs:
         cat /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null | grep -iE 'xnack|capability' | head || true
         echo "--- dmesg amdgpu tail ---"
         dmesg 2>/dev/null | grep -i amdgpu | tail -15 || echo "dmesg restricted"
-    - name: Bare-torch GPU smoke (matched nightly torch)
+    - name: Known-good set cp313/0.21.1 — full vLLM engine init on THIS runner
+      # The set that runs clean on a different generic-kernel gfx1151 box. Same
+      # wheels + recipe; the only variable is the physical box. Isolates
+      # box-vs-version for the tier2 hipErrorInvalidImage.
       run: |
         set -uo pipefail
         ROOT="$RUNNER_TEMP/rdiag"; rm -rf "$ROOT"; mkdir -p "$ROOT"
-        curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/20260623/cpython-3.14.6+20260623-x86_64-unknown-linux-gnu-install_only.tar.gz" | tar -xz -C "$ROOT"
-        PY="$ROOT/python/bin/python3.14"
+        curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.13.13+20260602-x86_64-unknown-linux-gnu-install_only.tar.gz" | tar -xz -C "$ROOT"
+        PY="$ROOT/python/bin/python3.13"; PIP="$ROOT/python/bin/pip"
+        SP="$ROOT/python/lib/python3.13/site-packages"
+        VV="0.21.1.dev0+rocm7.14.0a20260603.gad7125a43.d20260604"; STAMP="rocm7.14.0a20260603"
         "$PY" -m pip install -q "pip==24.3.1"
-        "$ROOT/python/bin/pip" install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch \
-          --extra-index-url https://pypi.org/simple/ "torch[device-gfx1151]==2.11.0+rocm7.14.0a20260624" || \
-        "$ROOT/python/bin/pip" install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch \
-          --extra-index-url https://pypi.org/simple/ "torch[device-gfx1151]==2.11.0+rocm7.14.0a20260622"
-        SP="$ROOT/python/lib/python3.14/site-packages"
+        pd(){ "$PY" -c 'import sys;sys.setrecursionlimit(20000);from pip._internal.cli.main import main;sys.exit(main(sys.argv[1:]))' "$@"; }
+        "$PIP" install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch --extra-index-url https://pypi.org/simple/ "torch[device-gfx1151]==2.11.0+$STAMP"
+        pd install -q --ignore-requires-python "amd-quark>=0.8.99"
+        pd install --use-deprecated=legacy-resolver --ignore-requires-python --extra-index-url https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna --extra-index-url https://pypi.org/simple/ "vllm==$VV" 2>&1 | tail -2
+        "$PIP" install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch --extra-index-url https://pypi.org/simple/ "torchvision==0.26.0+$STAMP" || true
+        "$PIP" install -q "tokenizers>=0.22.0,<=0.23.0" pycountry || true
         for d in "$SP"/_rocm_sdk_*/lib "$SP"/torch/lib; do [ -d "$d" ] && LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}"; done
-        export LD_LIBRARY_PATH
+        LD_LIBRARY_PATH="$SP/_rocm_sdk_core/lib/llvm/lib:${LD_LIBRARY_PATH:-}"; export LD_LIBRARY_PATH
+        export PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
+        export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+        CLANG="$SP/_rocm_sdk_core/lib/llvm/bin/clang"; [ -f "$CLANG" ] && chmod +x "$CLANG" "$CLANG"-* 2>/dev/null; export CC="$CLANG"
         AMD_SERIALIZE_KERNEL=1 "$PY" -c "
-        import torch
-        print('torch', torch.__version__, '| hip', torch.version.hip, '| dev', torch.cuda.get_device_name())
-        x=torch.zeros(4,device='cuda'); torch.cuda.synchronize(); print('zeros+add', (x+1).cpu().tolist())
-        print('matmul', float((torch.randn(64,64,device='cuda',dtype=torch.float16)@torch.randn(64,64,device='cuda',dtype=torch.float16)).sum()))
-        print('BARE TORCH OK')
-        " 2>&1 | tail -20
+        import torch, vllm; print('vllm', vllm.__version__, '| torch', torch.__version__, '| dev', torch.cuda.get_device_name())
+        from vllm import LLM, SamplingParams
+        llm=LLM(model='Qwen/Qwen2.5-0.5B-Instruct', dtype='float16', max_model_len=512, gpu_memory_utilization=0.5, enforce_eager=True)
+        print('GENERATED:', llm.generate(['Hello'], SamplingParams(max_tokens=8))[0].outputs[0].text)
+        print('RUNNER cp313/0.21.1 RAN CLEAN')
+        " 2>&1 | tail -30
         rm -rf "$ROOT"
