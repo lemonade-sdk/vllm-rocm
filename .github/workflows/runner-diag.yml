@@ -1,0 +1,51 @@
+name: Runner GPU Diag
+# Pinned kernel/driver diagnostic for the dev_lab gfx1151 runner, to compare a
+# working box (vLLM runs) vs the failing one. push-triggered (scoped to this
+# file) so it runs from a feature branch.
+on:
+  push:
+    branches: [ci/pin-devlab-runner]
+    paths: ['.github/workflows/runner-diag.yml']
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner name label'
+        required: false
+        default: 'ta-devlab-halo-03'
+
+jobs:
+  diag:
+    runs-on: [self-hosted, Linux, "${{ github.event.inputs.runner || 'ta-devlab-halo-03' }}"]
+    steps:
+    - name: Kernel / driver facts
+      run: |
+        echo "host: $(hostname)"
+        echo "kernel: $(uname -r)"
+        echo "amdgpu driver: $(cat /sys/module/amdgpu/version 2>/dev/null || echo n/a)"
+        echo "--- installed kernels ---"; ls /lib/modules 2>/dev/null || true
+        echo "--- kfd node xnack/capability ---"
+        cat /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null | grep -iE 'xnack|capability' | head || true
+        echo "--- dmesg amdgpu tail ---"
+        dmesg 2>/dev/null | grep -i amdgpu | tail -15 || echo "dmesg restricted"
+    - name: Bare-torch GPU smoke (matched nightly torch)
+      run: |
+        set -uo pipefail
+        ROOT="$RUNNER_TEMP/rdiag"; rm -rf "$ROOT"; mkdir -p "$ROOT"
+        curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/20260623/cpython-3.14.6+20260623-x86_64-unknown-linux-gnu-install_only.tar.gz" | tar -xz -C "$ROOT"
+        PY="$ROOT/python/bin/python3.14"
+        "$PY" -m pip install -q "pip==24.3.1"
+        "$ROOT/python/bin/pip" install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch \
+          --extra-index-url https://pypi.org/simple/ "torch[device-gfx1151]==2.11.0+rocm7.14.0a20260624" || \
+        "$ROOT/python/bin/pip" install -q --index-url https://rocm.nightlies.amd.com/whl-multi-arch \
+          --extra-index-url https://pypi.org/simple/ "torch[device-gfx1151]==2.11.0+rocm7.14.0a20260622"
+        SP="$ROOT/python/lib/python3.14/site-packages"
+        for d in "$SP"/_rocm_sdk_*/lib "$SP"/torch/lib; do [ -d "$d" ] && LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}"; done
+        export LD_LIBRARY_PATH
+        AMD_SERIALIZE_KERNEL=1 "$PY" -c "
+        import torch
+        print('torch', torch.__version__, '| hip', torch.version.hip, '| dev', torch.cuda.get_device_name())
+        x=torch.zeros(4,device='cuda'); torch.cuda.synchronize(); print('zeros+add', (x+1).cpu().tolist())
+        print('matmul', float((torch.randn(64,64,device='cuda',dtype=torch.float16)@torch.randn(64,64,device='cuda',dtype=torch.float16)).sum()))
+        print('BARE TORCH OK')
+        " 2>&1 | tail -20
+        rm -rf "$ROOT"
