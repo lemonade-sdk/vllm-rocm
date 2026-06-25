@@ -121,7 +121,7 @@ jobs:
     # GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched from
     # here. Build needs only network + pip (no GPU); it shares the box with
     # qualify, which runs after via `needs`.
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, ta-devlab-halo-03]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream) when this nightly has
     # already been qualified. is_new is always true for PRs and stable.
@@ -609,7 +609,7 @@ jobs:
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, ta-devlab-halo-03]
     env:
       GFX: gfx1151
     # Only on release builds. Skips PRs, dispatches with create_release=false,
