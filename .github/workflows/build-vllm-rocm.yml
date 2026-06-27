@@ -449,6 +449,20 @@ jobs:
         sed -i 's|mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)|_pso = os.path.join(dirname, "hip_utils_prebuilt.so")\n        if os.path.exists(_pso):\n            import importlib.util as _ilu\n            _sp = _ilu.spec_from_file_location("hip_utils", _pso)\n            mod = _ilu.module_from_spec(_sp)\n            _sp.loader.exec_module(mod)\n        else:\n            mod = compile_module_from_src(src=src, name="hip_utils", include_dirs=include_dirs)|' "$DRIVER_PY"
         $VLLM_ROOT/bin/python3 -c "import ast; ast.parse(open('$DRIVER_PY').read()); print('Patched driver.py — syntax OK')"
 
+    - name: Build NVML stub (hides NVIDIA GPUs on hybrid AMD+NVIDIA systems)
+      run: |
+        # Compile a tiny LD_PRELOAD stub that intercepts NVML init and
+        # device enumeration. When preloaded, pynvml sees zero NVIDIA GPUs
+        # and vLLM's CUDA platform plugin stays inactive, while the ROCm
+        # platform activates normally through HIP/ROCm libraries.
+        STUB_SRC="$GITHUB_WORKSPACE/scripts/nvml-stub/nvml_stub.c"
+        STUB_SO="$VLLM_ROOT/lib/nvml_stub.so"
+        mkdir -p "$VLLM_ROOT/lib"
+        gcc -shared -fPIC -O2 -o "$STUB_SO" "$STUB_SRC"
+        echo "NVML stub compiled: $STUB_SO ($(stat -c%s "$STUB_SO") bytes)"
+        # Smoke: verify symbols
+        nm -D "$STUB_SO" | grep nvml || true
+
     - name: Create launcher script
       run: |
         cat > $VLLM_ROOT/bin/vllm-server << 'LAUNCHER_EOF'
@@ -471,6 +485,17 @@ jobs:
         CLANG="$SP/_rocm_sdk_core/lib/llvm/bin/clang"
         [ -f "$CLANG" ] && chmod +x "$CLANG" "$CLANG"-* 2>/dev/null
         export CC="$CLANG"
+        # On hybrid AMD+NVIDIA laptops, vLLM's platform detection finds both
+        # CUDA (pynvml sees the dGPU) and ROCm and raises RuntimeError:
+        # "Only one platform plugin can be activated". Preload the NVML stub
+        # so pynvml sees zero NVIDIA GPUs and the CUDA platform stays inactive,
+        # while ROCm probes through HIP/ROCm libs normally.
+        if [ "${VLLM_TARGET_DEVICE:-}" = "rocm" ]; then
+            NVML_STUB="$VENV_DIR/lib/nvml_stub.so"
+            if [ -f "$NVML_STUB" ]; then
+                export LD_PRELOAD="$NVML_STUB${LD_PRELOAD:+:$LD_PRELOAD}"
+            fi
+        fi
         exec "$SCRIPT_DIR/python3" -m vllm.entrypoints.openai.api_server "$@"
         LAUNCHER_EOF
 
