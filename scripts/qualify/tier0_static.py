@@ -17,6 +17,14 @@ Checks:
   T0.3  DT_NEEDED resolution           — each NEEDED soname of the native exts
         is either a base system lib or present in the bundle (non-gating warn).
   T0.4  structural manifest            — required files exist; launcher parses.
+  T0.5  gfx code-object packs present  — every .kpack the AMD device wheels
+        declare in their dist-info RECORD exists on disk and is non-empty. The
+        per-gfx GPU code objects ship in HIDDEN dot-dirs (torch/.kpack/,
+        _rocm_sdk_libraries/.kpack/); actions/upload-artifact drops hidden files
+        unless include-hidden-files is set, producing a bundle that loads and
+        enumerates the GPU but dies on the first kernel launch with
+        hipErrorInvalidImage. This static check catches that drop before the
+        hardware tiers (and before release).
   T0.6  amdsmi path sanity             — bundled amdsmi package is present.
 
 Usage:
@@ -163,10 +171,22 @@ def check_torch_pin(sp):
         "required_release": req_rel,
         "bundled_release": inst_rel,
     }
-    if not req_rel or not inst_rel:
+    if not inst_rel:
+        # No bundled torch version is genuinely suspicious — flag it.
         return (
             report.STATUS_WARN,
-            "could not determine torch versions from metadata",
+            "could not determine bundled torch version from metadata",
+            details,
+        )
+    if not req_rel:
+        # vLLM declares no torch pin. The universal-RDNA nightly vLLM wheel does
+        # this by design (it ships no `Requires-Dist: torch`), so there is
+        # nothing to compare against — SKIP rather than WARN, otherwise this
+        # check would permanently block nightly promotion. A mismatch is still
+        # caught below for channels whose vLLM DOES pin torch (e.g. stable).
+        return (
+            report.STATUS_SKIP,
+            "vLLM declares no torch pin; nothing to verify",
             details,
         )
     if req_rel != inst_rel:
@@ -309,6 +329,67 @@ def check_structural_manifest(sp, root):
     return (report.STATUS_PASS, None, details)
 
 
+def declared_kpacks(sp):
+    """Relative .kpack paths the installed AMD device wheels list in RECORD.
+
+    The per-gfx GPU code objects ship in hidden dot-dirs
+    (torch/.kpack/torch_<gfx>.kpack, _rocm_sdk_libraries/.kpack/*_<gfx>.kpack).
+    Each is declared in the owning wheel's dist-info RECORD — which is NOT
+    hidden and so always survives artifact upload — giving an authoritative
+    manifest to check the (hidden, droppable) files against.
+    """
+    rels = []
+    for record in glob.glob(os.path.join(sp, "*.dist-info", "RECORD")):
+        with open(record, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                rel = line.split(",", 1)[0].strip()
+                if rel.endswith(".kpack"):
+                    rels.append(rel)
+    return sorted(set(rels))
+
+
+def check_gfx_code_objects(sp):
+    declared = declared_kpacks(sp)
+    if not declared:
+        # No .kpack layout (e.g. a channel whose wheels embed code objects in
+        # the .so). Nothing to verify here.
+        return (
+            report.STATUS_SKIP,
+            "no .kpack code-object packs declared by any wheel",
+            {"declared": 0},
+        )
+
+    missing = []
+    empty = []
+    present = []
+    for rel in declared:
+        path = os.path.join(sp, rel)
+        if not os.path.exists(path):
+            missing.append(rel)
+        elif os.path.getsize(path) == 0:
+            empty.append(rel)
+        else:
+            present.append({"path": rel, "bytes": os.path.getsize(path)})
+
+    details = {
+        "declared": len(declared),
+        "present": len(present),
+        "missing": missing,
+        "empty": empty,
+        "present_files": present,
+    }
+    if missing or empty:
+        broken = missing + empty
+        return (
+            report.STATUS_FAIL,
+            f"{len(broken)} gfx code-object pack(s) missing/empty "
+            f"(e.g. {broken[0]}) — hidden .kpack dropped at packaging? "
+            "set include-hidden-files: true on upload-artifact",
+            details,
+        )
+    return (report.STATUS_PASS, None, details)
+
+
 def check_amdsmi_path(sp):
     amd_smi = os.path.join(sp, "_rocm_sdk_core", "share", "amd_smi")
     details = {"path": amd_smi, "exists": os.path.isdir(amd_smi)}
@@ -378,6 +459,11 @@ def main():
         "T0.4",
         "structural manifest",
         lambda: check_structural_manifest(sp, root),
+    )
+    tier.run(
+        "T0.5",
+        "gfx code-object packs present",
+        lambda: check_gfx_code_objects(sp),
     )
     tier.run(
         "T0.6", "amdsmi path sanity", lambda: check_amdsmi_path(sp), gating=False

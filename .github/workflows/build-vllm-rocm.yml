@@ -577,6 +577,14 @@ jobs:
       with:
         name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
         path: ${{ env.VLLM_ROOT }}/
+        # CRITICAL: the AMD ROCm wheels ship the per-gfx GPU code objects in
+        # HIDDEN dot-dirs (torch/.kpack/torch_gfx1151.kpack,
+        # _rocm_sdk_libraries/.kpack/{blas,fft,rand,rccl}_lib_gfx1151.kpack,
+        # .devel_links/). Since v4, upload-artifact EXCLUDES hidden files by
+        # default — dropping these silently produces a bundle that loads and
+        # enumerates the GPU but dies on the first kernel launch with
+        # hipErrorInvalidImage. include-hidden-files keeps them. Do not remove.
+        include-hidden-files: true
         retention-days: 30
         compression-level: 6
 
@@ -600,12 +608,12 @@ jobs:
         # No sudo — it's under the runner's temp dir. Free the box for the next run.
         rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 15-test qualification on a self-hosted dev_lab Linux gfx1151 box. Targets just
+  # 16-test qualification on a self-hosted dev_lab Linux gfx1151 box. Targets just
   # [self-hosted, Linux] — the repo's only runners are the dev_lab pool, so this
   # matches whichever dev_lab Linux box is online without pinning to a name.
   # Runs the scripts/qualify harness against the built bundle:
-  #   tier0 static (5) + tier1 hardware smoke (5) + tier2 functional inference (5)
-  # = 15 tests, then aggregates them into a qualification report and a promotion
+  #   tier0 static (6) + tier1 hardware smoke (5) + tier2 functional inference (5)
+  # = 16 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
@@ -704,7 +712,7 @@ jobs:
           if [ ! -e "$link" ]; then ln -sf "$name" "$link"; fi
         done
 
-    - name: Run 15-test qualification (tier0 + tier1 + tier2)
+    - name: Run 16-test qualification (tier0 + tier1 + tier2)
       id: qual
       run: |
         WORK="${{ runner.temp }}/vllm-qual"
@@ -714,7 +722,7 @@ jobs:
         Q="$GITHUB_WORKSPACE/scripts/qualify"
         TAG="vllm${{ needs.build-ubuntu.outputs.vllm_version }}-${GFX}"
 
-        # The tiers are run WITHOUT --fail-on-error so all 15 tests execute and
+        # The tiers are run WITHOUT --fail-on-error so all 16 tests execute and
         # emit a JSON fragment even when one fails; `aggregate --fail-on-no-promote`
         # is the single gate that decides pass/fail for the whole job.
         echo "::group::Tier 0 — static bundle verification (T0.1–T0.6)"

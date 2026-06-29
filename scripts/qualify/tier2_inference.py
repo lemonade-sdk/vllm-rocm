@@ -111,6 +111,14 @@ class Server:
         )
 
     def stop(self):
+        """Gracefully stop the server's OWN process group.
+
+        The server is launched with start_new_session=True, so the API server
+        and its EngineCore children share a process group of their own; killing
+        that group is precise and never touches this harness. The broader
+        straggler sweep runs only AFTER the report is written — see
+        sweep_orphans().
+        """
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
@@ -120,13 +128,30 @@ class Server:
                     os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        # vLLM spawns child processes whose titles ("VLLM::EngineCore") don't
-        # match "vllm.entrypoints"; case-insensitively sweep all of them so no
-        # orphan keeps holding VRAM into the next tier/run.
-        subprocess.run(
-            ["pkill", "-9", "-if", "vllm|enginecore|resource_tracker"],
-            check=False,
-        )
+
+
+def sweep_orphans():
+    """Last-resort kill of straggler vLLM server/engine processes (VRAM).
+
+    Runs only AFTER the tier report is on disk. The pattern is anchored to the
+    server's own process titles — "vllm.entrypoints…" (API server),
+    "VLLM::EngineCore" (engine children), and the multiprocessing
+    resource_tracker — NOT bare "vllm". Bare "vllm" also matches THIS harness's
+    command line: both its interpreter and its --bundle-root live under
+    ".../vllm-qual/vllm/...". The old bare-"vllm" sweep ran inside stop() and
+    SIGKILLed the harness itself the moment inference began succeeding and
+    reached teardown, killing it before tier.write() and losing the report
+    ("tier2 missing"). Keep this anchored and keep it after the write.
+    """
+    subprocess.run(
+        [
+            "pkill",
+            "-9",
+            "-if",
+            r"vllm\.entrypoints|VLLM::EngineCore|multiprocessing\.resource_tracker",
+        ],
+        check=False,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -292,6 +317,10 @@ def main():
     tier.write(args.output)
     tier.print_summary()
     print(f"\nWrote {args.output}")
+
+    # Only now that the report is durably written do we sweep any stragglers.
+    # (sweep_orphans is anchored so it cannot match this harness — see its doc.)
+    sweep_orphans()
 
     if args.fail_on_error and tier.rollup_status() == report.STATUS_FAIL:
         sys.exit(1)
