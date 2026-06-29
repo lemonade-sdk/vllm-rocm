@@ -113,15 +113,19 @@ jobs:
         echo "Generated matrix: $matrix_targets"
 
   build-ubuntu:
-    # Any self-hosted Linux box in this repo's runner pool (the dev_lab group).
-    # Just [self-hosted, Linux] — the repo only has access to dev_lab runners, so
-    # this matches a dev_lab Linux box without pinning to a name (box names get
-    # reassigned on re-image, e.g. halo-01 came back as Windows). AMD's
-    # frameworks-nightlies host allowlists these boxes' egress but 403s
-    # GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched from
+    # Target the dev_lab runner GROUP explicitly, not just labels. The org's
+    # Default group is visibility:all, so a bare [self-hosted, Linux] also
+    # matches Linux boxes in other groups (stx / sjlab / Default) the repo can
+    # see — runs landed on a non-dev_lab box. `group: dev_lab` + the Linux label
+    # selects only the dev_lab Linux box (currently ta-devlab-halo-03) with no
+    # name-pin, so it survives re-image/rename as long as the box stays in the
+    # group. AMD's frameworks-nightlies host allowlists these boxes' egress but
+    # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
     # here. Build needs only network + pip (no GPU); it shares the box with
     # qualify, which runs after via `needs`.
-    runs-on: [self-hosted, Linux]
+    runs-on:
+      group: dev_lab
+      labels: [self-hosted, Linux]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream) when this nightly has
     # already been qualified. is_new is always true for PRs and stable.
@@ -608,16 +612,18 @@ jobs:
         # No sudo — it's under the runner's temp dir. Free the box for the next run.
         rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 16-test qualification on a self-hosted dev_lab Linux gfx1151 box. Targets just
-  # [self-hosted, Linux] — the repo's only runners are the dev_lab pool, so this
-  # matches whichever dev_lab Linux box is online without pinning to a name.
+  # 16-test qualification on the dev_lab Linux gfx1151 box. Targets the dev_lab
+  # runner GROUP (not just labels) so it can't land on a Linux box in another
+  # group the repo can also see (Default is visibility:all) — see build-ubuntu.
   # Runs the scripts/qualify harness against the built bundle:
   #   tier0 static (6) + tier1 hardware smoke (5) + tier2 functional inference (5)
   # = 16 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on: [self-hosted, Linux]
+    runs-on:
+      group: dev_lab
+      labels: [self-hosted, Linux]
     env:
       GFX: gfx1151
     # Only on release builds. Skips PRs, dispatches with create_release=false,
