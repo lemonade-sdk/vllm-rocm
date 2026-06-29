@@ -171,10 +171,22 @@ def check_torch_pin(sp):
         "required_release": req_rel,
         "bundled_release": inst_rel,
     }
-    if not req_rel or not inst_rel:
+    if not inst_rel:
+        # No bundled torch version is genuinely suspicious — flag it.
         return (
             report.STATUS_WARN,
-            "could not determine torch versions from metadata",
+            "could not determine bundled torch version from metadata",
+            details,
+        )
+    if not req_rel:
+        # vLLM declares no torch pin. The universal-RDNA nightly vLLM wheel does
+        # this by design (it ships no `Requires-Dist: torch`), so there is
+        # nothing to compare against — SKIP rather than WARN, otherwise this
+        # check would permanently block nightly promotion. A mismatch is still
+        # caught below for channels whose vLLM DOES pin torch (e.g. stable).
+        return (
+            report.STATUS_SKIP,
+            "vLLM declares no torch pin; nothing to verify",
             details,
         )
     if req_rel != inst_rel:
