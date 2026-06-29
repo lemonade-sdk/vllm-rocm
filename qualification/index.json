@@ -1,7 +1,54 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-06-29T21:10:21Z",
+  "updated_at": "2026-06-29T21:31:06Z",
   "builds": [
+    {
+      "build_id": "28403194274-gfx1151-nightly",
+      "tag": "vllm0.23.1.dev0+rocm7.14.0a20260624.g0fc695fc6.d20260625-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "nightly",
+      "generated_at": "2026-06-29T21:31:06Z",
+      "run_id": "28403194274",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/28403194274",
+      "vllm_version": "0.23.1.dev0+rocm7.14.0a20260624.g0fc695fc6.d20260625",
+      "torch_version": "2.11.0+rocm7.14.0a20260624",
+      "rocm_version": "7.14.0",
+      "tests": {
+        "passed": 14,
+        "failed": 0,
+        "warned": 0,
+        "skipped": 1,
+        "total": 15
+      },
+      "qualified": true,
+      "overall": "pass",
+      "blocked_by": [],
+      "summary": {
+        "title": "Promoted \u2014 all required tiers passed",
+        "recommended_action": "None \u2014 the build qualified and can be released.",
+        "blocking_tests": [],
+        "source": "deterministic"
+      },
+      "results": {
+        "T0.1": "skip",
+        "T0.2": "pass",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "pass",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "pass",
+        "T2.1": "pass",
+        "T2.2": "pass",
+        "T2.3": "pass",
+        "T2.4": "pass",
+        "T2.5": "pass"
+      },
+      "report_url": "reports/28403194274-gfx1151-nightly.json"
+    },
     {
       "build_id": "28402179892-gfx1151-nightly",
       "tag": "vllm0.23.1.dev0+rocm7.14.0a20260624.g0fc695fc6.d20260625-gfx1151",
