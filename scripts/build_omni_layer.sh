@@ -100,6 +100,12 @@ echo "== installing vllm-omni==$VLLM_OMNI_VER + ${#OMNI_DEPS[@]} deps"
 "$PYBIN" -m pip install --ignore-requires-python -c "$CONSTRAINTS" \
   "vllm-omni==$VLLM_OMNI_VER" "${OMNI_DEPS[@]}"
 
+# --- re-strip pip (we bootstrapped it above) to match the base bundle --------
+# The base Strip step removes pip; we re-added it only to install this layer.
+# Remove it again so the omni bundle stays lean and passes qualification T0.4
+# (which flags an SP/pip dir as bundle bloat). Deps are installed; pip is done.
+rm -rf "$SP"/pip "$SP"/pip-*.dist-info "$SP"/wheel "$SP"/wheel-*.dist-info 2>/dev/null || true
+
 # --- omni launcher -----------------------------------------------------------
 # Mirrors bin/vllm-server's env (LD_LIBRARY_PATH/PYTHONPATH/clang) but execs the
 # vllm-omni CLI. The bundled bin/vllm has a hardcoded #!/opt/vllm shebang that
