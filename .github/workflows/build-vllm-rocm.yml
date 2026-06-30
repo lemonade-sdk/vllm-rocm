@@ -658,16 +658,22 @@ jobs:
       labels: [self-hosted, Linux]
     env:
       GFX: gfx1151
-    # Only on release builds. Skips PRs, dispatches with create_release=false,
-    # and dispatches that didn't select gfx1151 (nothing to test → release ungated).
+    # Runs on release builds AND on omni dispatches (omni is experimental —
+    # always qualify it, even as a no-publish dry run; release stays gated on
+    # create_release in the create-release job). Skips PRs and dispatches that
+    # didn't select gfx1151 (nothing to test → release ungated).
     if: >-
       github.event_name != 'pull_request' &&
       (
         github.event_name == 'schedule' ||
         (
           github.event_name == 'workflow_dispatch' &&
-          (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) &&
-          contains(github.event.inputs.gfx_target, 'gfx1151')
+          contains(github.event.inputs.gfx_target, 'gfx1151') &&
+          (
+            github.event.inputs.create_release == 'true' ||
+            github.event.inputs.create_release == null ||
+            github.event.inputs.omni == 'true'
+          )
         )
       )
     steps:
