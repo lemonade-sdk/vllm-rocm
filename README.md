@@ -110,9 +110,12 @@ build is the base bundle plus `vllm-omni`, its runtime deps, an ABI-matched
 
 It ships as a **separate release artifact** (tag `vllm-omni<ver>-rocm<ver>-<gfx>`),
 not folded into the lean LLM bundle — omni pulls ~1 GB of extra deps that
-plain-LLM users should not carry. Trigger it from the **Build vLLM + ROCm**
-workflow with the `omni: true` dispatch input (`vllm-omni`'s version is
-auto-matched to the base vLLM major.minor). Run a serving model with
+plain-LLM users should not carry. It **auto-builds daily** for gfx1151 (a second
+`schedule` cron at 16:30 UTC) — builds on the current nightly base, qualifies
+via `tier2_omni`, and publishes the `vllm-omni*` release on green — and can also
+be built on demand from the **Build vLLM + ROCm** workflow with the `omni: true`
+dispatch input (`vllm-omni`'s version is auto-matched to the base vLLM
+major.minor). Run a serving model with
 `bin/vllm-omni-server serve <model> --omni --deploy-config <single-gpu.yaml>`;
 on a single-GPU box you must supply a deploy config that colocates all stages on
 device 0 (the upstream defaults target multi-GPU hosts).

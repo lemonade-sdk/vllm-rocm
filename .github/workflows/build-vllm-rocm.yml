@@ -39,9 +39,19 @@ on:
     # Daily: poll for a new nightly. The detect-nightly job dedups against the
     # qualification feed, so days with no new wheel cost only the cheap poll.
     - cron: '0 15 * * *'
+    # Daily omni auto-build (gfx1151 only). Distinguished from the plain nightly
+    # by github.event.schedule below; builds vLLM-Omni on the current nightly
+    # base, qualifies it (tier2_omni), and publishes the vllm-omni* release on
+    # green. Offset 90 min so it queues behind the plain nightly on the shared
+    # single-GPU dev_lab runner. NOTE: omni is not deduped like plain nightly —
+    # it rebuilds daily even if the base is unchanged (cheap relative to value;
+    # add an omni-specific dedup later if runner time becomes a concern).
+    - cron: '30 16 * * *'
 
 env:
-  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
+  # Omni auto-build cron targets gfx1151 only (the qualified, hardware-validated
+  # target); plain nightly + dispatch keep the full target set.
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || (github.event.schedule == '30 16 * * *' && 'gfx1151') || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
   # Channel is a run-level parameter (not a matrix axis): stable and nightly
   # have different triggers and different upstream sources, so they run as
   # separate workflow runs. Scheduled runs default to nightly.
@@ -50,7 +60,7 @@ env:
   # channel) and release it as a separate vllm-omni* artifact. vLLM-Omni is a
   # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
   # (see scripts/build_omni_layer.sh). Off for normal nightly/stable runs.
-  OMNI: ${{ github.event.inputs.omni || 'false' }}
+  OMNI: ${{ github.event.inputs.omni || (github.event.schedule == '30 16 * * *') || 'false' }}
 
 jobs:
   # Decide whether AMD has published a nightly vLLM wheel we have not already
@@ -144,7 +154,7 @@ jobs:
     # up (and qualify/create-release already skip PRs). Runs on dispatch + cron.
     # Omni builds are explicit manual dispatches — build regardless of the
     # nightly dedup (which would skip an already-qualified base).
-    if: (needs.detect-nightly.outputs.is_new == 'true' || github.event.inputs.omni == 'true') && github.event_name != 'pull_request'
+    if: (needs.detect-nightly.outputs.is_new == 'true' || github.event.inputs.omni == 'true' || github.event.schedule == '30 16 * * *') && github.event_name != 'pull_request'
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
