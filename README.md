@@ -99,6 +99,24 @@ Our GitHub Actions workflow:
 
 > **Linux (gfx1150/APU):** OOM despite free VRAM? Add `ttm.pages_limit=12582912` (48 GB) to the kernel cmdline (e.g. GRUB), run `update-grub`, then reboot. See [TheRock FAQ](https://github.com/ROCm/TheRock/blob/main/docs/faq.md#gfx1151-strix-halo-specific-questions).
 
+### vLLM-Omni variant (experimental)
+
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni) serves omni / any-to-any
+multimodal models (Qwen-Omni, Cosmos3, …). It is a **pure-Python layer** on top
+of the same base vLLM + PyTorch + Triton this repo already bundles, so the omni
+build is the base bundle plus `vllm-omni`, its runtime deps, an ABI-matched
+`torchaudio`, and a `bin/vllm-omni-server` launcher — see
+[`scripts/build_omni_layer.sh`](scripts/build_omni_layer.sh).
+
+It ships as a **separate release artifact** (tag `vllm-omni<ver>-rocm<ver>-<gfx>`),
+not folded into the lean LLM bundle — omni pulls ~1 GB of extra deps that
+plain-LLM users should not carry. Trigger it from the **Build vLLM + ROCm**
+workflow with the `omni: true` dispatch input (`vllm-omni`'s version is
+auto-matched to the base vLLM major.minor). Run a serving model with
+`bin/vllm-omni-server serve <model> --omni --deploy-config <single-gpu.yaml>`;
+on a single-GPU box you must supply a deploy config that colocates all stages on
+device 0 (the upstream defaults target multi-GPU hosts).
+
 ## Dependencies
 
 ### Runtime (bundled in the release)
