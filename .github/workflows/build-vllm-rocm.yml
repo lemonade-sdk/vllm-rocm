@@ -26,6 +26,11 @@ on:
         description: 'Stable channel: vLLM version to install (cp313 wheel at rocm.frameworks.amd.com/whl/gfx1151/vllm/)'
         required: false
         default: '0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513'
+      omni:
+        description: 'Also layer vLLM-Omni onto the bundle and release it as a separate vllm-omni* artifact (implies a build regardless of nightly dedup)'
+        required: false
+        default: false
+        type: boolean
 
   pull_request:
     types: [opened, synchronize, reopened]
@@ -34,13 +39,28 @@ on:
     # Daily: poll for a new nightly. The detect-nightly job dedups against the
     # qualification feed, so days with no new wheel cost only the cheap poll.
     - cron: '0 15 * * *'
+    # Daily omni auto-build (gfx1151 only). Distinguished from the plain nightly
+    # by github.event.schedule below; builds vLLM-Omni on the current nightly
+    # base, qualifies it (tier2_omni), and publishes the vllm-omni* release on
+    # green. Offset 90 min so it queues behind the plain nightly on the shared
+    # single-GPU dev_lab runner. NOTE: omni is not deduped like plain nightly —
+    # it rebuilds daily even if the base is unchanged (cheap relative to value;
+    # add an omni-specific dedup later if runner time becomes a concern).
+    - cron: '30 16 * * *'
 
 env:
-  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
+  # Omni auto-build cron targets gfx1151 only (the qualified, hardware-validated
+  # target); plain nightly + dispatch keep the full target set.
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || (github.event.schedule == '30 16 * * *' && 'gfx1151') || 'gfx110X,gfx1151,gfx1150,gfx120X' }}
   # Channel is a run-level parameter (not a matrix axis): stable and nightly
   # have different triggers and different upstream sources, so they run as
   # separate workflow runs. Scheduled runs default to nightly.
   CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
+  # When true, layer vLLM-Omni on top of the base bundle (built on the same
+  # channel) and release it as a separate vllm-omni* artifact. vLLM-Omni is a
+  # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
+  # (see scripts/build_omni_layer.sh). Off for normal nightly/stable runs.
+  OMNI: ${{ github.event.inputs.omni || (github.event.schedule == '30 16 * * *') || 'false' }}
 
 jobs:
   # Decide whether AMD has published a nightly vLLM wheel we have not already
@@ -132,13 +152,17 @@ jobs:
     # Also skip on pull_request: this is a heavy multi-target repackage that now
     # runs on the shared dev_lab GPU pool, so PR pushes must not tie those boxes
     # up (and qualify/create-release already skip PRs). Runs on dispatch + cron.
-    if: needs.detect-nightly.outputs.is_new == 'true' && github.event_name != 'pull_request'
+    # Omni builds are explicit manual dispatches — build regardless of the
+    # nightly dedup (which would skip an already-qualified base).
+    if: (needs.detect-nightly.outputs.is_new == 'true' || github.event.inputs.omni == 'true' || github.event.schedule == '30 16 * * *') && github.event_name != 'pull_request'
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
     outputs:
       vllm_version: ${{ steps.set-outputs.outputs.vllm_version }}
       torch_version: ${{ steps.set-outputs.outputs.torch_version }}
+      # Non-empty only on omni builds; create-release uses it to pick the tag.
+      omni_version: ${{ steps.set-outputs.outputs.omni_version }}
 
     steps:
     - name: Checkout repository
@@ -546,6 +570,19 @@ jobs:
         echo "Top consumers:"
         du -sh $SP/torch/ $SP/vllm/ $SP/_rocm_sdk_core/ $SP/aiter/ $SP/triton/ 2>/dev/null || true
 
+    - name: Layer vLLM-Omni onto the bundle (omni builds only)
+      # MUST run AFTER the Strip step: Strip deletes opencv/onnx/peft/timm (and
+      # pip) — exactly the deps the omni layer reinstalls. build_omni_layer.sh
+      # re-bootstraps pip and pulls vllm-omni + its runtime/multimodal deps + an
+      # ABI-matched torchaudio. torchaudio must come from the SAME ROCm index as
+      # the bundled torch: per-gfx stable index on the stable channel, AMD's
+      # multi-arch nightly index on nightly.
+      if: ${{ env.OMNI == 'true' }}
+      env:
+        TORCH_INDEX: ${{ env.CHANNEL == 'stable' && steps.wheel-urls.outputs.torch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+      run: |
+        bash scripts/build_omni_layer.sh
+
     - name: Verify bundled environment works
       run: |
         SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
@@ -605,6 +642,11 @@ jobs:
         torch_ver=$($VLLM_ROOT/bin/python3 -c "import torch; print(torch.__version__)")
         echo "vllm_version=$vllm_ver" >> $GITHUB_OUTPUT
         echo "torch_version=$torch_ver" >> $GITHUB_OUTPUT
+        # Empty on non-omni builds. Read from dist-info (no heavy import) so the
+        # create-release tag can distinguish vllm-omni* artifacts.
+        omni_ver=$(ls -d "$SP"/vllm_omni-*.dist-info 2>/dev/null | head -1 \
+          | sed -E 's#.*/vllm_omni-(.*)\.dist-info#\1#')
+        echo "omni_version=$omni_ver" >> $GITHUB_OUTPUT
 
     - name: Clean up
       if: always()
@@ -626,16 +668,22 @@ jobs:
       labels: [self-hosted, Linux]
     env:
       GFX: gfx1151
-    # Only on release builds. Skips PRs, dispatches with create_release=false,
-    # and dispatches that didn't select gfx1151 (nothing to test → release ungated).
+    # Runs on release builds AND on omni dispatches (omni is experimental —
+    # always qualify it, even as a no-publish dry run; release stays gated on
+    # create_release in the create-release job). Skips PRs and dispatches that
+    # didn't select gfx1151 (nothing to test → release ungated).
     if: >-
       github.event_name != 'pull_request' &&
       (
         github.event_name == 'schedule' ||
         (
           github.event_name == 'workflow_dispatch' &&
-          (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) &&
-          contains(github.event.inputs.gfx_target, 'gfx1151')
+          contains(github.event.inputs.gfx_target, 'gfx1151') &&
+          (
+            github.event.inputs.create_release == 'true' ||
+            github.event.inputs.create_release == null ||
+            github.event.inputs.omni == 'true'
+          )
         )
       )
     steps:
@@ -727,6 +775,10 @@ jobs:
         FRAG="$WORK/fragments"; mkdir -p "$FRAG"
         Q="$GITHUB_WORKSPACE/scripts/qualify"
         TAG="vllm${{ needs.build-ubuntu.outputs.vllm_version }}-${GFX}"
+        # Omni builds qualify the omni serving path and record an omni candidate tag.
+        if [ "$OMNI" = "true" ]; then
+          TAG="vllm-omni${{ needs.build-ubuntu.outputs.omni_version }}-${GFX}"
+        fi
 
         # The tiers are run WITHOUT --fail-on-error so all 16 tests execute and
         # emit a JSON fragment even when one fails; `aggregate --fail-on-no-promote`
@@ -741,12 +793,24 @@ jobs:
             --channel "$CHANNEL" --candidate-tag "$TAG" --output "$FRAG/tier1-report.json" || true
         echo "::endgroup::"
 
-        echo "::group::Tier 2 — functional inference (T2.1–T2.5)"
-        "$PY" "$Q/tier2_inference.py" --bundle-root "$ROOT" --gfx-target "$GFX" \
-            --channel "$CHANNEL" --candidate-tag "$TAG" \
-            --model Qwen/Qwen2.5-0.5B-Instruct --logs-dir "$FRAG" \
-            --output "$FRAG/tier2-report.json" || true
-        echo "::endgroup::"
+        # Tier 2 functional inference. Omni bundles run the omni serving path
+        # (vllm-omni-server + single-GPU deploy config) instead of plain vLLM;
+        # both emit a `tier2` fragment so the aggregate require-tiers rule is
+        # identical. The two are mutually exclusive per run.
+        if [ "$OMNI" = "true" ]; then
+          echo "::group::Tier 2 (omni) — functional inference via vllm-omni-server"
+          "$PY" "$Q/tier2_omni.py" --bundle-root "$ROOT" --gfx-target "$GFX" \
+              --channel "$CHANNEL" --candidate-tag "$TAG" --logs-dir "$FRAG" \
+              --output "$FRAG/tier2-report.json" || true
+          echo "::endgroup::"
+        else
+          echo "::group::Tier 2 — functional inference (T2.1–T2.5)"
+          "$PY" "$Q/tier2_inference.py" --bundle-root "$ROOT" --gfx-target "$GFX" \
+              --channel "$CHANNEL" --candidate-tag "$TAG" \
+              --model Qwen/Qwen2.5-0.5B-Instruct --logs-dir "$FRAG" \
+              --output "$FRAG/tier2-report.json" || true
+          echo "::endgroup::"
+        fi
 
         echo "=== Aggregate fragments → qualification report (gates the job) ==="
         "$PY" "$Q/aggregate.py" --fragments-dir "$FRAG" --gfx-target "$GFX" \
@@ -898,14 +962,22 @@ jobs:
       run: |
         VLLM_VERSION="${{ needs.build-ubuntu.outputs.vllm_version }}"
         TORCH_VERSION="${{ needs.build-ubuntu.outputs.torch_version }}"
+        OMNI_VERSION="${{ needs.build-ubuntu.outputs.omni_version }}"
         TARGET="${{ matrix.gfx_target }}"
 
         # Extract ROCm version from torch version string
         ROCM_VERSION=$(echo "$TORCH_VERSION" | grep -oP 'rocm[\d.]+' || echo "rocm")
 
-        # Tag format: vllm{version}-{rocm_version}-{gfx_target}
-        # e.g. vllm0.19.0-rocm7.12.0-gfx1150
-        TAG="vllm${VLLM_VERSION}-${ROCM_VERSION}-${TARGET}"
+        # Omni builds release as a SEPARATE artifact, tagged by the vllm-omni
+        # version so it never collides with the plain-vLLM bundle:
+        #   vllm-omni{omni_ver}-{rocm_version}-{gfx_target}
+        # Plain builds keep the existing scheme:
+        #   vllm{version}-{rocm_version}-{gfx_target}  e.g. vllm0.19.0-rocm7.12.0-gfx1150
+        if [ -n "$OMNI_VERSION" ]; then
+          TAG="vllm-omni${OMNI_VERSION}-${ROCM_VERSION}-${TARGET}"
+        else
+          TAG="vllm${VLLM_VERSION}-${ROCM_VERSION}-${TARGET}"
+        fi
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 

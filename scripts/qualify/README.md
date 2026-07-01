@@ -47,6 +47,12 @@ suffix (`…-stable` / `…-nightly`), **not** GitHub's single "latest" pointer
   amdsmi ASIC read (warn). **T1.5** `vllm-server --help`.
 - **T2.1** server boots. **T2.2** non-empty completion. **T2.3** greedy
   determinism. **T2.4** chat. **T2.5** streaming.
+- **Omni variant** (`tier2_omni.py`, run *instead of* `tier2_inference.py` on
+  builds made with the workflow's `omni: true` input): boots `vllm-omni-server`
+  on `Qwen2.5-Omni-3B` with a single-GPU deploy config
+  (`deploy/qwen2_5_omni_1gpu.yaml`) and checks **T2.1** omni server boot,
+  **T2.2** chat completion, **T2.3** streaming. Emits the same `tier2` fragment,
+  so promotion (`--require-tiers tier0,tier1,tier2`) is unchanged.
 - **T3.n** lemonade installs the candidate and each hot vLLM model loads + chats;
   tokens/sec and TTFT captured as metrics.
 
