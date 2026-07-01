@@ -471,6 +471,11 @@ jobs:
         export LD_LIBRARY_PATH
         export PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi:${PYTHONPATH:-}"
         export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+        # Ignore the user's ~/.local site-packages so the bundled, ROCm-matched
+        # torch/triton/amdsmi are always used (the bundled standalone CPython has
+        # ENABLE_USER_SITE=True, so a conflicting `pip install --user` copy would
+        # otherwise shadow the bundle's).
+        export PYTHONNOUSERSITE=1
         # Use bundled clang for Triton JIT (no system gcc needed)
         CLANG="$SP/_rocm_sdk_core/lib/llvm/bin/clang"
         [ -f "$CLANG" ] && chmod +x "$CLANG" "$CLANG"-* 2>/dev/null
