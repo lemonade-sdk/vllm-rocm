@@ -164,9 +164,13 @@ chmod +x "$VLLM_ROOT/bin/vllm-omni-server"
 
 # --- verify the layer imports under the launcher env ------------------------
 echo "== verifying vllm_omni import"
-LD_LIBRARY_PATH="$SP/_rocm_sdk_core/lib/llvm/lib" \
-PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi" \
-  "$VLLM_ROOT/bin/vllm-omni-server" --help >/dev/null 2>&1 \
-  || { echo "::error::vllm-omni-server failed to import"; exit 1; }
+if ! LD_LIBRARY_PATH="$SP/_rocm_sdk_core/lib/llvm/lib" \
+     PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi" \
+     "$VLLM_ROOT/bin/vllm-omni-server" --help > /tmp/omni-verify.log 2>&1; then
+  echo "::error::vllm-omni-server failed to import"
+  echo "----- vllm-omni-server --help output (last 60 lines) -----"
+  tail -60 /tmp/omni-verify.log
+  exit 1
+fi
 
 echo "== omni layer complete: vllm-omni==$VLLM_OMNI_VER on vLLM $BASE_VLLM"
