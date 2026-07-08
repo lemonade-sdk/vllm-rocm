@@ -40,12 +40,12 @@ on:
     # qualification feed, so days with no new wheel cost only the cheap poll.
     - cron: '0 15 * * *'
     # Daily omni auto-build (gfx1151 only). Distinguished from the plain nightly
-    # by github.event.schedule below; builds vLLM-Omni on the current nightly
-    # base, qualifies it (tier2_omni), and publishes the vllm-omni* release on
-    # green. Offset 90 min so it queues behind the plain nightly on the shared
-    # single-GPU dev_lab runner. NOTE: omni is not deduped like plain nightly —
-    # it rebuilds daily even if the base is unchanged (cheap relative to value;
-    # add an omni-specific dedup later if runner time becomes a concern).
+    # by github.event.schedule below; builds vLLM-Omni on the pinned base,
+    # qualifies it (tier2_omni), and publishes the vllm-omni* release on green.
+    # Offset 90 min so it queues behind the plain nightly on the shared
+    # single-GPU dev_lab runner. Deduped by the detect-omni step against the
+    # qualification feed (omni candidate tag), so an unchanged omni version costs
+    # only the cheap poll — no daily rebuild/requalify/republish of the same tag.
     - cron: '30 16 * * *'
 
 env:
@@ -82,6 +82,8 @@ jobs:
       vllm_whl: ${{ steps.detect.outputs.vllm_whl }}
       vllm_ver: ${{ steps.detect.outputs.vllm_ver }}
       rocm_stamp: ${{ steps.detect.outputs.rocm_stamp }}
+      omni_is_new: ${{ steps.detect-omni.outputs.omni_is_new }}
+      omni_candidate_ver: ${{ steps.detect-omni.outputs.omni_candidate_ver }}
     steps:
     - name: Detect new nightly
       id: detect
@@ -121,6 +123,51 @@ jobs:
         fi
         echo "is_new=$IS_NEW" >> "$GITHUB_OUTPUT"
 
+    # Omni dedup. The omni base is pinned (OMNI_BASE_VLLM_VER) and the omni
+    # version auto-resolves to the newest vllm-omni matching the base's
+    # major.minor, so the candidate release is fully determined BEFORE the build.
+    # Dedup key = the omni candidate tag (vllm-omni{ver}-gfx1151), the same `tag`
+    # the qualify job records in the feed for PASS AND FAIL — so an already-tried
+    # omni version (green or red) is not rebuilt daily; only a new version (a base
+    # bump or a new vllm-omni point release) runs. Fails OPEN, and force=true
+    # bypasses, matching the nightly dedup above.
+    - name: Detect omni candidate
+      id: detect-omni
+      if: env.OMNI == 'true' && github.event_name != 'pull_request'
+      run: |
+        set -uo pipefail
+        OMNI_IS_NEW=true
+        BASE_MM=$(echo "$OMNI_BASE_VLLM_VER" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')
+        OMNI_VER=$(BASE_MM="$BASE_MM" python3 - <<'PY'
+        import json, os, urllib.request
+        base = os.environ["BASE_MM"]
+        try:
+            d = json.load(urllib.request.urlopen("https://pypi.org/pypi/vllm-omni/json", timeout=30))
+            cands = [v for v in d["releases"] if v.split("rc")[0].rsplit(".", 1)[0] == base]
+            print(sorted(cands)[-1] if cands else "")
+        except Exception:
+            print("")
+        PY
+        )
+        if [ -z "$OMNI_VER" ]; then
+          echo "::warning::could not resolve a vllm-omni release for base $BASE_MM — proceeding (build resolves/fails loudly)"
+        else
+          CAND_TAG="vllm-omni${OMNI_VER}-gfx1151"
+          echo "omni candidate: $OMNI_VER (feed tag $CAND_TAG)"
+          FEED="https://raw.githubusercontent.com/${{ github.repository }}/qualification-data/qualification/index.json"
+          SEEN=$(curl -fsSL "$FEED" 2>/dev/null | CAND_TAG="$CAND_TAG" python3 -c 'import sys,json,os; d=json.load(sys.stdin); print("SEEN" if any(b.get("tag")==os.environ["CAND_TAG"] for b in d.get("builds",[])) else "NEW")' 2>/dev/null || echo "NEW")
+          if [ "$SEEN" = "SEEN" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            OMNI_IS_NEW=false
+            echo "omni $OMNI_VER already qualified — skipping this run (dispatch with force=true to re-run)."
+          elif [ "$SEEN" = "SEEN" ]; then
+            echo "omni $OMNI_VER already qualified but force=true — re-running anyway."
+          else
+            echo "new omni $OMNI_VER — running the pipeline."
+          fi
+        fi
+        echo "omni_candidate_ver=$OMNI_VER" >> "$GITHUB_OUTPUT"
+        echo "omni_is_new=$OMNI_IS_NEW" >> "$GITHUB_OUTPUT"
+
   prepare-matrix:
     runs-on: ubuntu-22.04
     outputs:
@@ -154,14 +201,27 @@ jobs:
       group: dev_lab
       labels: [self-hosted, Linux]
     needs: [prepare-matrix, detect-nightly]
-    # Skip the whole build (and everything downstream) when this nightly has
-    # already been qualified. is_new is always true for PRs and stable.
-    # Also skip on pull_request: this is a heavy multi-target repackage that now
-    # runs on the shared dev_lab GPU pool, so PR pushes must not tie those boxes
-    # up (and qualify/create-release already skip PRs). Runs on dispatch + cron.
-    # Omni builds are explicit manual dispatches — build regardless of the
-    # nightly dedup (which would skip an already-qualified base).
-    if: (needs.detect-nightly.outputs.is_new == 'true' || github.event.inputs.omni == 'true' || github.event.schedule == '30 16 * * *') && github.event_name != 'pull_request'
+    # Skip the whole build (and everything downstream — qualify/create-release
+    # cascade off a skipped build) when this build has already been qualified.
+    # Two mutually-exclusive dedup keys, selected by mode:
+    #   omni run   -> omni_is_new (omni candidate tag vs the feed)
+    #   plain run  -> is_new      (nightly wheel version vs the feed)
+    # Both are 'true' for a genuinely new candidate or when force=true.
+    # Also skip on pull_request: this is a heavy multi-target repackage that runs
+    # on the shared dev_lab GPU pool, so PR pushes must not tie those boxes up
+    # (and qualify/create-release already skip PRs). Runs on dispatch + cron.
+    # "omni run" mirrors the env.OMNI predicate (env isn't available at job level).
+    if: >-
+      github.event_name != 'pull_request' &&
+      (
+        (
+          (github.event.inputs.omni == 'true' || github.event.schedule == '30 16 * * *')
+            && needs.detect-nightly.outputs.omni_is_new == 'true'
+        ) || (
+          !(github.event.inputs.omni == 'true' || github.event.schedule == '30 16 * * *')
+            && needs.detect-nightly.outputs.is_new == 'true'
+        )
+      )
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
