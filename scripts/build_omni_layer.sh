@@ -82,23 +82,47 @@ if ! "$PYBIN" -c 'import torchaudio' >/dev/null 2>&1; then
 fi
 
 # --- vllm-omni + runtime deps ------------------------------------------------
-# --ignore-requires-python: every vllm-omni release pins Python <3.14, but the
-# qualified nightly base is cp314. The cap is conservative — validated to run on
-# 3.14 — and this is a bundle we control + qualify, so we override it here. (The
-# base install already uses --ignore-requires-python for amd-quark's cp<3.13 cap.)
-OMNI_DEPS=(
-  aenum omegaconf "diffusers==0.38.0" "cache-dit==1.3.0" x-transformers torchsde
-  janus prettytable av soundfile einops "openai-whisper" onnxruntime "imageio[ffmpeg]"
-  # multimodal deps the base bundle trims but omni model loading needs:
-  timm opencv-python-headless peft
-)
-# vllm-omni's own Requires-Dist (incl. fa3-fwd) is pulled by naming it as a
-# top-level requirement below; OMNI_DEPS only adds the multimodal extras the
-# base trim drops plus exact-pinned deps for resolver stability.
+# Two-step install so --ignore-requires-python is scoped to vllm-omni ONLY.
+#
+# 1. vllm-omni itself: every release pins Python <3.14, but the qualified nightly
+#    base is cp314. The cap is conservative (validated to run on 3.14) and this
+#    is a bundle we control + qualify, so we override it with
+#    --ignore-requires-python + --no-deps.
+# 2. Its runtime deps (+ the multimodal extras the base trim drops), installed
+#    WITHOUT that flag. Passed to the whole resolve, the flag strips the
+#    Python-version filter from every transitive dep too, so pip picked
+#    numba 0.62 (no cp314 wheel -> sdist -> setup.py refuses 3.14) over
+#    numba 0.63 (has a cp314 wheel). Scoping it here is the same pattern the
+#    base install uses for amd-quark.
+echo "== installing vllm-omni==$VLLM_OMNI_VER (no-deps)"
+"$PYBIN" -m pip install --no-deps --ignore-requires-python "vllm-omni==$VLLM_OMNI_VER"
 
-echo "== installing vllm-omni==$VLLM_OMNI_VER + ${#OMNI_DEPS[@]} deps"
-"$PYBIN" -m pip install --ignore-requires-python -c "$CONSTRAINTS" \
-  "vllm-omni==$VLLM_OMNI_VER" "${OMNI_DEPS[@]}"
+# Read vllm-omni's core (non-extra) runtime deps from its metadata so this tracks
+# the installed version instead of a hand-maintained list.
+mapfile -t OMNI_REQS < <("$PYBIN" - "$SP" <<'PY'
+import glob, os, sys
+sp = sys.argv[1]
+metas = glob.glob(os.path.join(sp, "vllm_omni-*.dist-info", "METADATA"))
+if not metas:
+    sys.exit("vllm_omni dist-info not found after install")
+for line in open(metas[0], encoding="utf-8", errors="replace"):
+    if not line.startswith("Requires-Dist:"):
+        continue
+    spec = line.split(":", 1)[1].strip()
+    if "extra ==" in spec:                  # skip optional extras (dev/demo/…)
+        continue
+    spec = spec.split(";", 1)[0].strip()    # drop any environment marker
+    if spec:
+        print(spec)
+PY
+)
+[ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
+
+# Multimodal deps the base bundle trims but omni model loading needs.
+OMNI_EXTRAS=(timm opencv-python-headless peft)
+
+echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
+"$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
 
 # --- re-strip pip (we bootstrapped it above) to match the base bundle --------
 # The base Strip step removes pip; we re-added it only to install this layer.
