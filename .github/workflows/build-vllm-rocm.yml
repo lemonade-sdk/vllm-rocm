@@ -61,6 +61,13 @@ env:
   # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
   # (see scripts/build_omni_layer.sh). Off for normal nightly/stable runs.
   OMNI: ${{ github.event.inputs.omni || (github.event.schedule == '30 16 * * *') || 'false' }}
+  # Qualified base the omni layer builds on. vLLM-Omni 0.23.0rc1 does NOT support
+  # the bleeding-edge nightly base (its transformers 5.13 breaks ming.py's
+  # AutoFeatureExtractor.register; numpy 2.5 breaks numba/openai-whisper), so
+  # omni builds pin this validated base instead of tracking the latest nightly.
+  # Bump when a newer vLLM-Omni supports a newer base. (Used in the nightly
+  # install step below.)
+  OMNI_BASE_VLLM_VER: "0.23.1.dev0+rocm7.14.0a20260624.g0fc695fc6.d20260625"
 
 jobs:
   # Decide whether AMD has published a nightly vLLM wheel we have not already
@@ -339,6 +346,14 @@ jobs:
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
           fi
           [ -n "$VLLM_VER" ] || { echo "::error::no cp314 nightly vLLM version found"; exit 1; }
+          # Omni builds pin the qualified base (vLLM-Omni 0.23.0rc1 can't ride
+          # the latest nightly — see OMNI_BASE_VLLM_VER). Override the detected
+          # version so build/qualify/release all use the validated base.
+          if [ "$OMNI" = "true" ]; then
+            VLLM_VER="$OMNI_BASE_VLLM_VER"
+            ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
+            echo "omni: pinning base to $VLLM_VER (stamp $ROCM_STAMP)"
+          fi
           # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
           # bump TORCH_VER here when vLLM bumps its torch requirement.
           TORCH_VER=2.11.0
