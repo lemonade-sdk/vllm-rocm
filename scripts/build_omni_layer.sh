@@ -60,12 +60,14 @@ PY
 echo "== base vLLM=$BASE_VLLM (mm=$BASE_MM) torch=$TORCH_VER -> vllm-omni==$VLLM_OMNI_VER"
 
 # Protect the GPU-coupled stack so dep resolution can never swap the ROCm
-# torch/vllm/triton/transformers for a PyPI build. safetensors/accelerate are
-# left to float (diffusers 0.38 needs safetensors>=0.8).
+# torch/vllm/triton for a PyPI build. safetensors/accelerate float (diffusers
+# 0.38 needs safetensors>=0.8). transformers is deliberately NOT protected: the
+# base ships 5.13, but vLLM-Omni 0.23.0rc1's ming.py uses the pre-5.13
+# AutoFeatureExtractor.register(str, ...) API, so we pin it <5.13 below.
 CONSTRAINTS=/tmp/omni-constraints.txt
 "$PYBIN" - > "$CONSTRAINTS" <<'PY'
 import importlib.metadata as m
-for p in ("torch","vllm","pytorch-triton-rocm","triton","torchvision","torchaudio","transformers","numpy"):
+for p in ("torch","vllm","pytorch-triton-rocm","triton","torchvision","torchaudio","numpy"):
     try: print(f"{p}=={m.version(p)}")
     except Exception: pass
 PY
@@ -82,23 +84,61 @@ if ! "$PYBIN" -c 'import torchaudio' >/dev/null 2>&1; then
 fi
 
 # --- vllm-omni + runtime deps ------------------------------------------------
-# --ignore-requires-python: every vllm-omni release pins Python <3.14, but the
-# qualified nightly base is cp314. The cap is conservative — validated to run on
-# 3.14 — and this is a bundle we control + qualify, so we override it here. (The
-# base install already uses --ignore-requires-python for amd-quark's cp<3.13 cap.)
-OMNI_DEPS=(
-  aenum omegaconf "diffusers==0.38.0" "cache-dit==1.3.0" x-transformers torchsde
-  janus prettytable av soundfile einops "openai-whisper" onnxruntime "imageio[ffmpeg]"
-  # multimodal deps the base bundle trims but omni model loading needs:
-  timm opencv-python-headless peft
-)
-# vllm-omni's own Requires-Dist (incl. fa3-fwd) is pulled by naming it as a
-# top-level requirement below; OMNI_DEPS only adds the multimodal extras the
-# base trim drops plus exact-pinned deps for resolver stability.
+# Two-step install so --ignore-requires-python is scoped to vllm-omni ONLY.
+#
+# 1. vllm-omni itself: every release pins Python <3.14, but the qualified nightly
+#    base is cp314. The cap is conservative (validated to run on 3.14) and this
+#    is a bundle we control + qualify, so we override it with
+#    --ignore-requires-python + --no-deps.
+# 2. Its runtime deps (+ the multimodal extras the base trim drops), installed
+#    WITHOUT that flag. Passed to the whole resolve, the flag strips the
+#    Python-version filter from every transitive dep too, so pip picked
+#    numba 0.62 (no cp314 wheel -> sdist -> setup.py refuses 3.14) over
+#    numba 0.63 (has a cp314 wheel). Scoping it here is the same pattern the
+#    base install uses for amd-quark.
+echo "== installing vllm-omni==$VLLM_OMNI_VER (no-deps)"
+"$PYBIN" -m pip install --no-deps --ignore-requires-python "vllm-omni==$VLLM_OMNI_VER"
 
-echo "== installing vllm-omni==$VLLM_OMNI_VER + ${#OMNI_DEPS[@]} deps"
-"$PYBIN" -m pip install --ignore-requires-python -c "$CONSTRAINTS" \
-  "vllm-omni==$VLLM_OMNI_VER" "${OMNI_DEPS[@]}"
+# Read vllm-omni's core (non-extra) runtime deps from its metadata so this tracks
+# the installed version instead of a hand-maintained list.
+mapfile -t OMNI_REQS < <("$PYBIN" - "$SP" <<'PY'
+import glob, os, sys
+sp = sys.argv[1]
+metas = glob.glob(os.path.join(sp, "vllm_omni-*.dist-info", "METADATA"))
+if not metas:
+    sys.exit("vllm_omni dist-info not found after install")
+for line in open(metas[0], encoding="utf-8", errors="replace"):
+    if not line.startswith("Requires-Dist:"):
+        continue
+    spec = line.split(":", 1)[1].strip()
+    if "extra ==" in spec:                  # skip optional extras (dev/demo/…)
+        continue
+    spec = spec.split(";", 1)[0].strip()    # drop any environment marker
+    if not spec:
+        continue
+    # openai-whisper pulls numba, which caps numpy<2.5; the nightly base ships
+    # numpy>=2.5, so numba is uninstallable here. openai-whisper (import whisper)
+    # is only used by the magi_human / ming model paths — not Qwen-Omni, the
+    # server entrypoint, or `import vllm_omni` — so skip it. The omni bundle
+    # still serves the models we ship + qualify. (Verified: vllm-omni-server
+    # imports fine without it.)
+    if spec.lower().startswith("openai-whisper"):
+        continue
+    print(spec)
+PY
+)
+[ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
+
+# Multimodal deps the base bundle trims but omni model loading needs, plus a
+# transformers cap: vLLM-Omni 0.23.0rc1 eagerly imports ming.py, which calls the
+# pre-5.13 AutoFeatureExtractor.register(str, ...) API. transformers 5.13
+# changed it (expects a config class -> AttributeError on import). Pin <5.13
+# (resolves to 5.12.x, what the qualified base shipped); downgrades the base's
+# 5.13 for the omni bundle. vLLM 0.23.1 works with 5.12 (the qualified base did).
+OMNI_EXTRAS=(timm opencv-python-headless peft "transformers<5.13")
+
+echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
+"$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
 
 # --- re-strip pip (we bootstrapped it above) to match the base bundle --------
 # The base Strip step removes pip; we re-added it only to install this layer.
@@ -131,9 +171,13 @@ chmod +x "$VLLM_ROOT/bin/vllm-omni-server"
 
 # --- verify the layer imports under the launcher env ------------------------
 echo "== verifying vllm_omni import"
-LD_LIBRARY_PATH="$SP/_rocm_sdk_core/lib/llvm/lib" \
-PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi" \
-  "$VLLM_ROOT/bin/vllm-omni-server" --help >/dev/null 2>&1 \
-  || { echo "::error::vllm-omni-server failed to import"; exit 1; }
+if ! LD_LIBRARY_PATH="$SP/_rocm_sdk_core/lib/llvm/lib" \
+     PYTHONPATH="$SP/_rocm_sdk_core/share/amd_smi" \
+     "$VLLM_ROOT/bin/vllm-omni-server" --help > /tmp/omni-verify.log 2>&1; then
+  echo "::error::vllm-omni-server failed to import"
+  echo "----- vllm-omni-server --help output (last 60 lines) -----"
+  tail -60 /tmp/omni-verify.log
+  exit 1
+fi
 
 echo "== omni layer complete: vllm-omni==$VLLM_OMNI_VER on vLLM $BASE_VLLM"
