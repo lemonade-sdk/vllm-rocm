@@ -60,12 +60,14 @@ PY
 echo "== base vLLM=$BASE_VLLM (mm=$BASE_MM) torch=$TORCH_VER -> vllm-omni==$VLLM_OMNI_VER"
 
 # Protect the GPU-coupled stack so dep resolution can never swap the ROCm
-# torch/vllm/triton/transformers for a PyPI build. safetensors/accelerate are
-# left to float (diffusers 0.38 needs safetensors>=0.8).
+# torch/vllm/triton for a PyPI build. safetensors/accelerate float (diffusers
+# 0.38 needs safetensors>=0.8). transformers is deliberately NOT protected: the
+# base ships 5.13, but vLLM-Omni 0.23.0rc1's ming.py uses the pre-5.13
+# AutoFeatureExtractor.register(str, ...) API, so we pin it <5.13 below.
 CONSTRAINTS=/tmp/omni-constraints.txt
 "$PYBIN" - > "$CONSTRAINTS" <<'PY'
 import importlib.metadata as m
-for p in ("torch","vllm","pytorch-triton-rocm","triton","torchvision","torchaudio","transformers","numpy"):
+for p in ("torch","vllm","pytorch-triton-rocm","triton","torchvision","torchaudio","numpy"):
     try: print(f"{p}=={m.version(p)}")
     except Exception: pass
 PY
@@ -127,8 +129,13 @@ PY
 )
 [ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
 
-# Multimodal deps the base bundle trims but omni model loading needs.
-OMNI_EXTRAS=(timm opencv-python-headless peft)
+# Multimodal deps the base bundle trims but omni model loading needs, plus a
+# transformers cap: vLLM-Omni 0.23.0rc1 eagerly imports ming.py, which calls the
+# pre-5.13 AutoFeatureExtractor.register(str, ...) API. transformers 5.13
+# changed it (expects a config class -> AttributeError on import). Pin <5.13
+# (resolves to 5.12.x, what the qualified base shipped); downgrades the base's
+# 5.13 for the omni bundle. vLLM 0.23.1 works with 5.12 (the qualified base did).
+OMNI_EXTRAS=(timm opencv-python-headless peft "transformers<5.13")
 
 echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
 "$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
