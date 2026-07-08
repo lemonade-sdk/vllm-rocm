@@ -118,17 +118,19 @@ PY
 )
 [ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
 
-# Multimodal deps the base bundle trims but omni model loading needs, plus
-# resolver guards for the openai-whisper -> numba -> llvmlite chain on cp314:
-# the base bundle ships llvmlite 0.47 (pinned), which no cp314 numba wheel pairs
-# with, so pip backtracks to the numba 0.62 sdist (setup.py rejects 3.14).
-# Floor numba above the sdist and force llvmlite past 0.47 so pip stays on
-# wheels (numba 0.66 + llvmlite 0.48, both cp314). llvmlite's only consumer is
-# numba, so bumping it is safe for the rest of the bundle.
-OMNI_EXTRAS=(timm opencv-python-headless peft "numba>=0.63" "llvmlite>=0.48")
+# Multimodal deps the base bundle trims but omni model loading needs.
+OMNI_EXTRAS=(timm opencv-python-headless peft)
 
+# --only-binary=numba,llvmlite: openai-whisper pulls numba, whose sdist
+# (setup.py) refuses Python 3.14, and the base bundle pins llvmlite 0.47. The
+# numba 0.65.x WHEELS accept llvmlite 0.47, so forbidding the numba/llvmlite
+# sdists makes pip settle on that wheel instead of backtracking into the numba
+# 0.62 sdist. Do NOT try to force llvmlite up (it's pinned in the bundle, so
+# >=0.48 is ResolutionImpossible); pip picks the numba wheel that matches
+# whatever llvmlite the base ships.
 echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
-"$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
+"$PYBIN" -m pip install --only-binary=numba,llvmlite -c "$CONSTRAINTS" \
+  "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
 
 # --- re-strip pip (we bootstrapped it above) to match the base bundle --------
 # The base Strip step removes pip; we re-added it only to install this layer.
