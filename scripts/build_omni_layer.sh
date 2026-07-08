@@ -118,8 +118,14 @@ PY
 )
 [ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
 
-# Multimodal deps the base bundle trims but omni model loading needs.
-OMNI_EXTRAS=(timm opencv-python-headless peft)
+# Multimodal deps the base bundle trims but omni model loading needs, plus
+# resolver guards for the openai-whisper -> numba -> llvmlite chain on cp314:
+# the base bundle ships llvmlite 0.47 (pinned), which no cp314 numba wheel pairs
+# with, so pip backtracks to the numba 0.62 sdist (setup.py rejects 3.14).
+# Floor numba above the sdist and force llvmlite past 0.47 so pip stays on
+# wheels (numba 0.66 + llvmlite 0.48, both cp314). llvmlite's only consumer is
+# numba, so bumping it is safe for the rest of the bundle.
+OMNI_EXTRAS=(timm opencv-python-headless peft "numba>=0.63" "llvmlite>=0.48")
 
 echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
 "$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
