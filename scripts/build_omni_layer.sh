@@ -112,8 +112,17 @@ for line in open(metas[0], encoding="utf-8", errors="replace"):
     if "extra ==" in spec:                  # skip optional extras (dev/demo/…)
         continue
     spec = spec.split(";", 1)[0].strip()    # drop any environment marker
-    if spec:
-        print(spec)
+    if not spec:
+        continue
+    # openai-whisper pulls numba, which caps numpy<2.5; the nightly base ships
+    # numpy>=2.5, so numba is uninstallable here. openai-whisper (import whisper)
+    # is only used by the magi_human / ming model paths — not Qwen-Omni, the
+    # server entrypoint, or `import vllm_omni` — so skip it. The omni bundle
+    # still serves the models we ship + qualify. (Verified: vllm-omni-server
+    # imports fine without it.)
+    if spec.lower().startswith("openai-whisper"):
+        continue
+    print(spec)
 PY
 )
 [ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
@@ -121,16 +130,8 @@ PY
 # Multimodal deps the base bundle trims but omni model loading needs.
 OMNI_EXTRAS=(timm opencv-python-headless peft)
 
-# --only-binary=numba,llvmlite: openai-whisper pulls numba, whose sdist
-# (setup.py) refuses Python 3.14, and the base bundle pins llvmlite 0.47. The
-# numba 0.65.x WHEELS accept llvmlite 0.47, so forbidding the numba/llvmlite
-# sdists makes pip settle on that wheel instead of backtracking into the numba
-# 0.62 sdist. Do NOT try to force llvmlite up (it's pinned in the bundle, so
-# >=0.48 is ResolutionImpossible); pip picks the numba wheel that matches
-# whatever llvmlite the base ships.
 echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
-"$PYBIN" -m pip install --only-binary=numba,llvmlite -c "$CONSTRAINTS" \
-  "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
+"$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
 
 # --- re-strip pip (we bootstrapped it above) to match the base bundle --------
 # The base Strip step removes pip; we re-added it only to install this layer.
