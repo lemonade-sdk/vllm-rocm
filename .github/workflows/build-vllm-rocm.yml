@@ -286,6 +286,13 @@ jobs:
               exit 1
             fi
             ;;
+          gfx950)
+            suffix="gfx950-dcgpu"
+            if [ "$CHANNEL" != "stable" ]; then
+              echo "::error::gfx950 requires channel=stable — AMD publishes no CDNA nightly vLLM wheel"
+              exit 1
+            fi
+            ;;
           *)
             echo "ERROR: No AMD pre-built wheels for target: $target"
             exit 1
