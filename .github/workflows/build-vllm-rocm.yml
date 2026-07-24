@@ -278,6 +278,21 @@ jobs:
           gfx1151) suffix="gfx1151" ;;
           gfx1150) suffix="gfx1150" ;;
           gfx120X) suffix="gfx120X-all" ;;
+          # AMD's nightly vLLM line is device-all-RDNA: CDNA is stable-only.
+          gfx942)
+            suffix="gfx94X-dcgpu"
+            if [ "$CHANNEL" != "stable" ]; then
+              echo "::error::gfx942 requires channel=stable — AMD publishes no CDNA nightly vLLM wheel"
+              exit 1
+            fi
+            ;;
+          gfx950)
+            suffix="gfx950-dcgpu"
+            if [ "$CHANNEL" != "stable" ]; then
+              echo "::error::gfx950 requires channel=stable — AMD publishes no CDNA nightly vLLM wheel"
+              exit 1
+            fi
+            ;;
           *)
             echo "ERROR: No AMD pre-built wheels for target: $target"
             exit 1
@@ -1042,6 +1057,12 @@ jobs:
 
         # Extract ROCm version from torch version string
         ROCM_VERSION=$(echo "$TORCH_VERSION" | grep -oP 'rocm[\d.]+' || echo "rocm")
+
+        # Some AMD stable wheels stamp __version__ with +local metadata; stable tags
+        # carry the public version only. Nightly keeps the full version by design.
+        if [ "$CHANNEL" = "stable" ]; then
+          VLLM_VERSION="${VLLM_VERSION%%+*}"
+        fi
 
         # Omni builds release as a SEPARATE artifact, tagged by the vllm-omni
         # version so it never collides with the plain-vLLM bundle:
