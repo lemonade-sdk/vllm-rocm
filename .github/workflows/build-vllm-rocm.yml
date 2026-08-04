@@ -91,6 +91,9 @@ jobs:
         set -uo pipefail
         IS_NEW=true
         if [ "$CHANNEL" = "nightly" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+          # RDNA line: this job gates the DAILY CRON, which is RDNA-driven. CDNA
+          # targets resolve their own version in the build step from
+          # device-all-cdna, so dedup here is deliberately RDNA-keyed.
           NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna
           # AMD's nightly vLLM is cp314 (Python 3.14); the old cp313 line is frozen.
           WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
@@ -278,21 +281,11 @@ jobs:
           gfx1151) suffix="gfx1151" ;;
           gfx1150) suffix="gfx1150" ;;
           gfx120X) suffix="gfx120X-all" ;;
-          # AMD's nightly vLLM line is device-all-RDNA: CDNA is stable-only.
-          gfx942)
-            suffix="gfx94X-dcgpu"
-            if [ "$CHANNEL" != "stable" ]; then
-              echo "::error::gfx942 requires channel=stable — AMD publishes no CDNA nightly vLLM wheel"
-              exit 1
-            fi
-            ;;
-          gfx950)
-            suffix="gfx950-dcgpu"
-            if [ "$CHANNEL" != "stable" ]; then
-              echo "::error::gfx950 requires channel=stable — AMD publishes no CDNA nightly vLLM wheel"
-              exit 1
-            fi
-            ;;
+          # CDNA. These suffixes are the STABLE-channel per-card aisles; the
+          # nightly channel uses AMD's device-all-cdna line instead (resolved in
+          # the install step, which is the only place the channel is known).
+          gfx942) suffix="gfx94X-dcgpu" ;;
+          gfx950) suffix="gfx950-dcgpu" ;;
           *)
             echo "ERROR: No AMD pre-built wheels for target: $target"
             exit 1
@@ -398,8 +391,18 @@ jobs:
           # universal RDNA vLLM wheel plus a date-stamped matched torch; we pair
           # them by the shared ROCm build stamp (rocm7.14.0a<DATE>), so the set
           # is ABI-consistent by construction — no pinning around mismatches.
-          NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna
+          # AMD publishes the nightly vLLM as TWO separate per-family lines,
+          # device-all-rdna and device-all-cdna, at independent versions. The
+          # line must therefore follow the matrix target, not be hardcoded.
+          # (torch does NOT: whl-multi-arch carries every arch, including
+          # rocm-sdk-device-gfx942/-gfx950, so the torch half is family-agnostic.)
+          case "${{ matrix.gfx_target }}" in
+            gfx942|gfx950) NIGHTLY_SET=device-all-cdna ;;
+            *)             NIGHTLY_SET=device-all-rdna ;;
+          esac
+          NIGHTLY_VLLM=https://rocm.frameworks-nightlies.amd.com/whl/$NIGHTLY_SET
           NIGHTLY_TORCH=https://rocm.nightlies.amd.com/whl-multi-arch
+          echo "nightly vLLM line: $NIGHTLY_SET"
           # torch's per-gfx kernels are an extra; map the matrix target to it.
           case "${{ matrix.gfx_target }}" in
             gfx1151) DEV=gfx1151 ;;
@@ -411,8 +414,17 @@ jobs:
           # 1. Use the version detect-nightly already resolved (so detect and
           #    build agree even if AMD publishes a newer one mid-run); else
           #    discover the newest cp314 wheel from the index.
-          VLLM_VER="${{ needs.detect-nightly.outputs.vllm_ver }}"
-          ROCM_STAMP="${{ needs.detect-nightly.outputs.rocm_stamp }}"
+          # detect-nightly probes the RDNA line only (it gates the daily cron),
+          # so its version is valid for RDNA targets ONLY. Reusing it for a CDNA
+          # build would pin a version that does not exist on the CDNA line; leave
+          # it empty so the self-discovery below resolves from $NIGHTLY_VLLM.
+          if [ "$NIGHTLY_SET" = "device-all-rdna" ]; then
+            VLLM_VER="${{ needs.detect-nightly.outputs.vllm_ver }}"
+            ROCM_STAMP="${{ needs.detect-nightly.outputs.rocm_stamp }}"
+          else
+            VLLM_VER=""
+            ROCM_STAMP=""
+          fi
           if [ -z "$VLLM_VER" ]; then
             WHL=$(curl -fsSL "$NIGHTLY_VLLM/vllm/" \
               | grep -oE 'vllm-[0-9][^"]*-cp314-cp314-linux_x86_64\.whl' \
