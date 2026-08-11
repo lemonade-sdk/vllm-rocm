@@ -1,7 +1,60 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-11T19:19:32Z",
+  "updated_at": "2026-08-11T22:04:55Z",
   "builds": [
+    {
+      "build_id": "31539589959-gfx1151-nightly",
+      "tag": "vllm0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "nightly",
+      "generated_at": "2026-08-11T22:04:55Z",
+      "run_id": "31539589959",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/31539589959",
+      "vllm_version": "0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724",
+      "torch_version": "2.12.0+rocm7.15.0a20260724",
+      "rocm_version": "7.15.0",
+      "tests": {
+        "passed": 8,
+        "failed": 2,
+        "warned": 0,
+        "skipped": 5,
+        "total": 15
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier1=fail",
+        "tier2=fail"
+      ],
+      "summary": {
+        "title": "torchvision::nms operator registration failure",
+        "recommended_action": "Verify torchvision and PyTorch ROCm 7.15.0a20260724 compatibility; ensure torchvision version supports the dispatch key registration pattern or update to compatible versions.",
+        "blocking_tests": [
+          "T1.5",
+          "T2.1"
+        ],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "skip",
+        "T0.2": "pass",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "pass",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "fail",
+        "T2.1": "fail",
+        "T2.2": "skip",
+        "T2.3": "skip",
+        "T2.4": "skip",
+        "T2.5": "skip"
+      },
+      "report_url": "reports/31539589959-gfx1151-nightly.json"
+    },
     {
       "build_id": "31510368450-gfx1151-nightly",
       "tag": "vllm0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724-gfx1151",
