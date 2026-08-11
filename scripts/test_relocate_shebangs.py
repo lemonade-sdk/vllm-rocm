@@ -87,6 +87,27 @@ class TestRewrite(Base):
         self.assertTrue(p.read_bytes().startswith(b"#!/bin/sh\n"))
 
 
+    def test_smoke_probes_the_real_interpreter_not_a_python3_crutch(self) -> None:
+        """glm: every fixture shipped a python3, masking a regex that never matched.
+
+        With no plain python3 present, a bundle built against python3.13 must
+        still pass -- the probe has to use the interpreter actually carried into
+        the rewritten scripts.
+        """
+        (self.bindir / "python3").unlink()
+        shutil.copy(sys.executable, self.bindir / "python3.13")
+        os.chmod(self.bindir / "python3.13", 0o755)
+        self.script("versioned", interp=b"python3.13")
+        r = self.run_cli()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("execs python3.13", r.stdout)
+
+    def test_us_ascii_underscore_form_is_treated_as_default(self) -> None:
+        """glm: the underscore normalisation was inert, so us_ascii was skipped."""
+        self.assertFalse(rs.displaces_a_real_encoding(b"# coding: us_ascii"))
+        self.assertTrue(rs.displaces_a_real_encoding(b"# -*- coding: latin-1 -*-"))
+
+
 class TestLeavesAlone(Base):
     def _unchanged(self, p: Path, before: bytes, r: subprocess.CompletedProcess) -> None:
         self.assertEqual(r.returncode, 0, r.stderr)

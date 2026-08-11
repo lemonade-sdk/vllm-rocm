@@ -52,7 +52,7 @@ PYTHON_NAME = re.compile(rb"^python[0-9]*(\.[0-9]+)*[a-z]?$")
 # line, so treating it as a blocker would skip the entire bundle. Only a
 # declaration of some OTHER encoding actually changes how the file is read.
 CODING_COOKIE = re.compile(rb"^[ \t\f]*#.*coding[:=][ \t]*([-_.a-zA-Z0-9]+)")
-DEFAULT_ENCODINGS = {b"utf-8", b"utf8", b"utf_8", b"ascii", b"us-ascii"}
+DEFAULT_ENCODINGS = {b"utf-8", b"utf8", b"ascii", b"us-ascii"}
 
 
 def displaces_a_real_encoding(second_line: bytes) -> bool:
@@ -60,7 +60,7 @@ def displaces_a_real_encoding(second_line: bytes) -> bool:
     match = CODING_COOKIE.match(second_line)
     if not match:
         return False
-    return match.group(1).lower().replace(b"-", b"-") not in DEFAULT_ENCODINGS
+    return match.group(1).lower().replace(b"_", b"-") not in DEFAULT_ENCODINGS
 
 RELOCATED_FIRST_LINE = b"#!/bin/sh\n"
 RELOCATED_MARKER = b"readlink -f"
@@ -288,7 +288,8 @@ def main() -> int:
         if path.name == rewritten[0]:
             with path.open("rb") as handle:
                 handle.readline()
-                match = re.search(rb'\)\)/([^"]+)"', handle.readline())
+                # the two closing parens are separated by a quote -- )")/ -- so anchor on )/
+                match = re.search(rb'\)/([^"]+)"', handle.readline())
             if match:
                 interpreter = match.group(1)
             break
