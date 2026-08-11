@@ -61,9 +61,8 @@ echo "== base vLLM=$BASE_VLLM (mm=$BASE_MM) torch=$TORCH_VER -> vllm-omni==$VLLM
 
 # Protect the GPU-coupled stack so dep resolution can never swap the ROCm
 # torch/vllm/triton for a PyPI build. safetensors/accelerate float (diffusers
-# 0.38 needs safetensors>=0.8). transformers is deliberately NOT protected: the
-# base ships 5.13, but vLLM-Omni 0.23.0rc1's ming.py uses the pre-5.13
-# AutoFeatureExtractor.register(str, ...) API, so we pin it <5.13 below.
+# 0.38 needs safetensors>=0.8). transformers is deliberately NOT protected:
+# vllm-omni's own Requires-Dist (applied via OMNI_REQS) governs its version.
 CONSTRAINTS=/tmp/omni-constraints.txt
 "$PYBIN" - > "$CONSTRAINTS" <<'PY'
 import importlib.metadata as m
@@ -73,14 +72,20 @@ for p in ("torch","vllm","pytorch-triton-rocm","triton","torchvision","torchaudi
 PY
 
 # --- ABI-matched torchaudio (omni api_server imports it eagerly) ------------
-# Not in the base bundle. Pull the build that matches the bundled torch
-# version+stamp from the same ROCm index the base used.
+# Not in the base bundle. torchaudio's version number no longer tracks
+# torch's (torch 2.12 pairs with torchaudio 2.11.0.x), so resolve the newest
+# torchaudio carrying the SAME ROCm build stamp as the bundled torch — same-
+# batch builds share the ABI regardless of the version number.
 if ! "$PYBIN" -c 'import torchaudio' >/dev/null 2>&1; then
-  echo "== installing torchaudio==$TORCH_VER from $TORCH_INDEX"
+  STAMP="${TORCH_VER#*+}"
+  TA_VER=$(curl -fsSL "${TORCH_INDEX:?set TORCH_INDEX to the base torch ROCm index}/torchaudio/" \
+    | grep -oE "torchaudio-[0-9][0-9.]*\+${STAMP}" | sed 's/^torchaudio-//' | sort -V | tail -1)
+  [ -n "$TA_VER" ] || { echo "::error::no torchaudio at stamp ${STAMP} on ${TORCH_INDEX}"; exit 1; }
+  echo "== installing torchaudio==$TA_VER from $TORCH_INDEX"
   "$PYBIN" -m pip install -c "$CONSTRAINTS" \
-    --index-url "${TORCH_INDEX:?set TORCH_INDEX to the base torch ROCm index}" \
+    --index-url "$TORCH_INDEX" \
     --extra-index-url https://pypi.org/simple/ \
-    "torchaudio==$TORCH_VER"
+    "torchaudio==$TA_VER"
 fi
 
 # --- vllm-omni + runtime deps ------------------------------------------------
@@ -129,13 +134,11 @@ PY
 )
 [ "${#OMNI_REQS[@]}" -gt 0 ] || { echo "::error::no vllm-omni runtime deps parsed"; exit 1; }
 
-# Multimodal deps the base bundle trims but omni model loading needs, plus a
-# transformers cap: vLLM-Omni 0.23.0rc1 eagerly imports ming.py, which calls the
-# pre-5.13 AutoFeatureExtractor.register(str, ...) API. transformers 5.13
-# changed it (expects a config class -> AttributeError on import). Pin <5.13
-# (resolves to 5.12.x, what the qualified base shipped); downgrades the base's
-# 5.13 for the omni bundle. vLLM 0.23.1 works with 5.12 (the qualified base did).
-OMNI_EXTRAS=(timm opencv-python-headless peft "transformers<5.13")
+# Multimodal deps the base bundle trims but omni model loading needs.
+# (vLLM-Omni 0.23 needed a transformers<5.13 cap for ming.py's pre-5.13
+# AutoFeatureExtractor API; 0.24+ supports 5.13, so vllm-omni's own
+# Requires-Dist — already applied via OMNI_REQS above — governs now.)
+OMNI_EXTRAS=(timm opencv-python-headless peft)
 
 echo "== installing ${#OMNI_REQS[@]} vllm-omni deps + ${#OMNI_EXTRAS[@]} multimodal extras"
 "$PYBIN" -m pip install -c "$CONSTRAINTS" "${OMNI_REQS[@]}" "${OMNI_EXTRAS[@]}"
