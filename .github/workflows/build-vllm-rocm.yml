@@ -445,10 +445,15 @@ jobs:
           # bump TORCH_VER here when vLLM bumps its torch requirement. The
           # 0.23.1 base that omni builds pin predates that bump and its native
           # ext resolves against the torch 2.11 ABI, so it keeps 2.11.0.
+          # TV_VER is torch's strictly-paired torchvision (used by the repair
+          # step below); they move together or torchvision::nms fails to
+          # register and `import vllm` dies.
           if [ "$OMNI" = "true" ]; then
             TORCH_VER=2.11.0
+            TV_VER=0.26.0
           else
             TORCH_VER=2.12.0
+            TV_VER=0.27.0
           fi
           echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
@@ -504,9 +509,8 @@ jobs:
           #    torchvision must match the ROCm torch ABI or its C++ ops
           #    (torchvision::nms) fail to register and `import vllm` dies. Legacy
           #    pulled a PyPI torchvision built against a different torch; force the
-          #    matched ROCm build from the nightly index, same rocm stamp. torch
-          #    2.11 pairs with torchvision 0.26 — bump TV_VER with TORCH_VER.
-          TV_VER=0.26.0
+          #    matched ROCm build from the nightly index, same rocm stamp.
+          #    TV_VER is set alongside TORCH_VER above — they pair strictly.
           $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
             --extra-index-url https://pypi.org/simple/ \
             "torchvision==${TV_VER}+${ROCM_STAMP}"
