@@ -685,6 +685,41 @@ jobs:
       run: |
         bash scripts/build_omni_layer.sh
 
+    - name: Make console-script shebangs relocatable
+      # pip writes the build-time interpreter path into every console script, so
+      # they fail with ENOENT on any machine that is not this runner. Rewrite the
+      # shebang to resolve python3 relative to the script. The trampoline is valid
+      # sh and a no-op string expression in Python, so the scripts still parse.
+      # Runs before the verify step so the bundle is checked in its shipped form.
+      run: |
+        cat > /tmp/tramp.txt <<'TRAMP'
+        #!/bin/sh
+        '''exec' "$(dirname "$(readlink -f "$0")")/python3" "$0" "$@"
+        ' '''
+        TRAMP
+        python3 - "$VLLM_ROOT/bin" /tmp/tramp.txt <<'PYEOF'
+        import os, pathlib, stat, sys
+        bindir = pathlib.Path(sys.argv[1])
+        tramp = pathlib.Path(sys.argv[2]).read_bytes()
+        fixed = 0
+        for f in sorted(bindir.iterdir()):
+            if not f.is_file() or f.is_symlink():
+                continue
+            try:
+                with f.open("rb") as fh:
+                    first = fh.readline()
+            except OSError:
+                continue
+            if not first.startswith(b"#!") or b"/bin/python" not in first:
+                continue
+            rest = f.read_bytes().split(b"\n", 1)[1]
+            mode = f.stat().st_mode
+            f.write_bytes(tramp + rest)
+            os.chmod(f, stat.S_IMODE(mode))
+            fixed += 1
+        print("rewrote %d console-script shebangs" % fixed)
+        PYEOF
+
     - name: Verify bundled environment works
       run: |
         SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
