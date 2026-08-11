@@ -687,14 +687,51 @@ jobs:
 
     - name: Make console-script shebangs relocatable
       # pip records the build-time interpreter path in every console script it
-      # generates, so they fail with ENOENT on any machine that is not this
-      # runner. Rewrite the shebang to resolve python3 relative to the script.
-      # Fails the build if it rewrites nothing, if any script is left pointing
-      # at the build interpreter, or if the rewritten form does not execute --
-      # a silent no-op here would ship a broken bundle with a green pipeline.
+      # generates, so on a consumer machine execve() fails and reports the
+      # SCRIPT as missing rather than the interpreter. Rewrite the shebang to
+      # resolve the interpreter next to the script. The replacement is valid sh
+      # and a no-op string expression in Python, so the scripts still parse.
+      # Fails on zero rewrites: nothing downstream executes a console script, so
+      # a silent no-op here would ship a broken bundle behind a green build.
       run: |
         : "${VLLM_ROOT:?VLLM_ROOT is unset -- refusing to guess the bundle path}"
-        python3 scripts/relocate_shebangs.py "$VLLM_ROOT/bin"
+        python3 - "$VLLM_ROOT/bin" <<'PYEOF'
+        import os, re, stat, sys
+        from pathlib import Path
+
+        bindir = Path(sys.argv[1])
+        prefixes = {str(bindir).encode(), str(bindir.resolve()).encode()}
+        name_re = re.compile(rb"^python[0-9]*(\.[0-9]+)*$")  # not python3-config
+        fixed = 0
+
+        for path in sorted(bindir.iterdir()):
+            if not path.is_file() or path.is_symlink():
+                continue
+            first, _, rest = path.read_bytes().partition(b"\n")
+            if not first.startswith(b"#!"):
+                continue
+            fields = first[2:].rstrip(b"\r").split()
+            if len(fields) != 1:
+                continue
+            prefix = next((p for p in prefixes if fields[0].startswith(p + b"/")), None)
+            if prefix is None:
+                continue
+            name = fields[0][len(prefix) + 1:]
+            if not name_re.match(name):
+                continue
+            mode = path.stat().st_mode
+            path.write_bytes(
+                b"#!/bin/sh\n"
+                b"'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/" + name + b"\" \"$0\" \"$@\"\n"
+                b"' '''\n" + rest
+            )
+            os.chmod(path, stat.S_IMODE(mode))
+            fixed += 1
+
+        print("rewrote %d console-script shebangs" % fixed)
+        if fixed == 0:
+            sys.exit("error: rewrote nothing -- refusing to ship an unchecked bundle")
+        PYEOF
 
     - name: Verify bundled environment works
       run: |
