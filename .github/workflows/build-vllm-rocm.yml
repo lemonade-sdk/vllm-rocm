@@ -61,13 +61,13 @@ env:
   # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
   # (see scripts/build_omni_layer.sh). Off for normal nightly/stable runs.
   OMNI: ${{ github.event.inputs.omni || (github.event.schedule == '30 16 * * *') || 'false' }}
-  # Qualified base the omni layer builds on. vLLM-Omni 0.23.0rc1 does NOT support
-  # the bleeding-edge nightly base (its transformers 5.13 breaks ming.py's
-  # AutoFeatureExtractor.register; numpy 2.5 breaks numba/openai-whisper), so
-  # omni builds pin this validated base instead of tracking the latest nightly.
-  # Bump when a newer vLLM-Omni supports a newer base. (Used in the nightly
-  # install step below.)
-  OMNI_BASE_VLLM_VER: "0.23.1.dev0+rocm7.14.0a20260624.g0fc695fc6.d20260625"
+  # Qualified base the omni layer builds on: detect-omni resolves the newest
+  # vllm-omni release matching this base's major.minor from PyPI (0.25.x ->
+  # vllm-omni 0.25.0rc1). Pinned to a base that passed full qualification
+  # (run 31541098026) rather than tracking the latest nightly; bump when a
+  # newer base qualifies AND a matching vllm-omni release exists. (Used in
+  # the nightly install step below.)
+  OMNI_BASE_VLLM_VER: "0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724"
 
 jobs:
   # Decide whether AMD has published a nightly vLLM wheel we have not already
@@ -441,9 +441,13 @@ jobs:
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
             echo "omni: pinning base to $VLLM_VER (stamp $ROCM_STAMP)"
           fi
-          # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
-          # bump TORCH_VER here when vLLM bumps its torch requirement.
-          TORCH_VER=2.11.0
+          # upstream vLLM 0.25.x pins torch 2.12.0 (the wheel itself strips it);
+          # bump TORCH_VER here when vLLM bumps its torch requirement — and
+          # TV_VER with it: torchvision pairs strictly with torch (used by the
+          # repair step below) or torchvision::nms fails to register and
+          # `import vllm` dies. The omni base (0.25.x) shares this ABI.
+          TORCH_VER=2.12.0
+          TV_VER=0.27.0
           echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
@@ -498,9 +502,8 @@ jobs:
           #    torchvision must match the ROCm torch ABI or its C++ ops
           #    (torchvision::nms) fail to register and `import vllm` dies. Legacy
           #    pulled a PyPI torchvision built against a different torch; force the
-          #    matched ROCm build from the nightly index, same rocm stamp. torch
-          #    2.11 pairs with torchvision 0.26 — bump TV_VER with TORCH_VER.
-          TV_VER=0.26.0
+          #    matched ROCm build from the nightly index, same rocm stamp.
+          #    TV_VER is set alongside TORCH_VER above — they pair strictly.
           $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
             --extra-index-url https://pypi.org/simple/ \
             "torchvision==${TV_VER}+${ROCM_STAMP}"
