@@ -700,6 +700,9 @@ jobs:
         python3 - "$VLLM_ROOT/bin" /tmp/tramp.txt <<'PYEOF'
         import os, pathlib, stat, sys
         bindir = pathlib.Path(sys.argv[1])
+        # match the literal path pip wrote AND the resolved one: $VLLM_ROOT may
+        # contain a symlinked component, in which case they differ.
+        prefixes = {str(bindir).encode(), str(bindir.resolve()).encode()}
         tramp = pathlib.Path(sys.argv[2]).read_bytes()
         fixed = 0
         for f in sorted(bindir.iterdir()):
@@ -710,9 +713,11 @@ jobs:
                     first = fh.readline()
             except OSError:
                 continue
-            if not first.startswith(b"#!") or b"/bin/python" not in first:
+            if not first.startswith(b"#!") or not any(x in first for x in prefixes):
                 continue
-            rest = f.read_bytes().split(b"\n", 1)[1]
+            head, sep, rest = f.read_bytes().partition(b"\n")
+            if not sep:
+                continue
             mode = f.stat().st_mode
             f.write_bytes(tramp + rest)
             os.chmod(f, stat.S_IMODE(mode))
