@@ -441,9 +441,15 @@ jobs:
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
             echo "omni: pinning base to $VLLM_VER (stamp $ROCM_STAMP)"
           fi
-          # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
-          # bump TORCH_VER here when vLLM bumps its torch requirement.
-          TORCH_VER=2.11.0
+          # upstream vLLM 0.25.x pins torch 2.12.0 (the wheel itself strips it);
+          # bump TORCH_VER here when vLLM bumps its torch requirement. The
+          # 0.23.1 base that omni builds pin predates that bump and its native
+          # ext resolves against the torch 2.11 ABI, so it keeps 2.11.0.
+          if [ "$OMNI" = "true" ]; then
+            TORCH_VER=2.11.0
+          else
+            TORCH_VER=2.12.0
+          fi
           echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
