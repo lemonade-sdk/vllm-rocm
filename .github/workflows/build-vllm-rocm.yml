@@ -204,9 +204,11 @@ jobs:
           | sed 's/^ *//;s/ *$//' \
           | jq -R . \
           | jq -s --argjson q "$QUALIFIED_RUNNERS" \
-              '{include: [.[] | select($q[.] != null) | {gfx: ., runner_group: $q[.]}]}' \
+              'unique | {include: [.[] | select($q[.] != null) | {gfx: ., runner_group: $q[.]}]}' \
           | jq -c)
-        qualify_targets=$(echo "$qualify_matrix" | jq -r '[.include[].gfx] | join(",")')
+        # JSON array (not a comma list): consumers use fromJson() set membership,
+        # so no target string can substring-match another.
+        qualify_targets=$(echo "$qualify_matrix" | jq -c '[.include[].gfx]')
         qualify_count=$(echo "$qualify_matrix" | jq -r '.include | length')
         echo "qualify_matrix=$qualify_matrix" >> $GITHUB_OUTPUT
         echo "qualify_targets=$qualify_targets" >> $GITHUB_OUTPUT
@@ -1223,7 +1225,7 @@ jobs:
       # Co-locate the qualification proof with the shippable artifact, for any
       # target that was hardware-qualified this run; best-effort so it never
       # fails the release.
-      if: contains(needs.prepare-matrix.outputs.qualify_targets, matrix.gfx_target)
+      if: contains(fromJson(needs.prepare-matrix.outputs.qualify_targets), matrix.gfx_target)
       continue-on-error: true
       env:
         GH_TOKEN: ${{ github.token }}
