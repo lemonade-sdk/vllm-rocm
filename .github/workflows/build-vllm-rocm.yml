@@ -891,7 +891,7 @@ jobs:
         fi
         rm -f "$ZIP"   # reclaim space immediately
         TARBALL=$(find "$WORK/raw" -name '*.tar.gz' | head -n1)
-        [ -n "$TARBALL" ] || { echo "::error::no release archive in gfx1151 artifact"; exit 1; }
+        [ -n "$TARBALL" ] || { echo "::error::no release archive in ${GFX} artifact"; exit 1; }
         tar -xzf "$TARBALL" -C "$DEST"
         rm -rf "$WORK/raw"
         echo "Extracted $(du -sh "$DEST" | cut -f1) to $DEST"
