@@ -715,19 +715,25 @@ jobs:
         echo ""
         du -sh $VLLM_ROOT/*/ 2>/dev/null
 
+    - name: Create release archive
+      run: |
+        # tar.gz preserves the ROCm symlinks (upload-artifact's zip expands each
+        # symlink into a full copy of its target, bloating the artifact). tar
+        # also keeps the hidden per-gfx GPU code-object dirs (torch/.kpack/,
+        # _rocm_sdk_*/.kpack/, .devel_links/) that ROCm wheels ship, so
+        # include-hidden-files is no longer needed.
+        ARCHIVE="$RUNNER_TEMP/vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64.tar.gz"
+        tar -czf "$ARCHIVE" -C "$VLLM_ROOT" .
+        echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+        echo "Created $(du -h "$ARCHIVE" | cut -f1) archive"
+
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: ${{ env.VLLM_ROOT }}/
-        # CRITICAL: the AMD ROCm wheels ship the per-gfx GPU code objects in
-        # HIDDEN dot-dirs (torch/.kpack/torch_gfx1151.kpack,
-        # _rocm_sdk_libraries/.kpack/{blas,fft,rand,rccl}_lib_gfx1151.kpack,
-        # .devel_links/). Since v4, upload-artifact EXCLUDES hidden files by
-        # default — dropping these silently produces a bundle that loads and
-        # enumerates the GPU but dies on the first kernel launch with
-        # hipErrorInvalidImage. include-hidden-files keeps them. Do not remove.
-        include-hidden-files: true
+        # Upload the intermediate tar.gz (not the raw bundle), so the artifact
+        # preserves symlinks and the hidden per-gfx code-object dirs on download.
+        path: ${{ env.ARCHIVE }}
         retention-days: 30
         compression-level: 6
 
@@ -805,7 +811,8 @@ jobs:
 
         # The build artifact is ~3.3 GB (extracts to ~11 GB). actions/download-artifact@v4
         # is unreliable for artifacts this size on self-hosted runners, so pull the
-        # artifact zip directly with curl (streams to disk, resumable) and unzip it.
+        # artifact zip directly with curl (streams to disk, resumable), unzip it to
+        # recover the release tar.gz, then untar it below.
         # Resolve the artifact id via the REST API with curl + python3 — the box
         # does not have the gh CLI installed.
         ART_ID=$(curl -fsSL \
@@ -839,19 +846,27 @@ jobs:
         echo "Downloaded zip: $(du -h "$ZIP" | cut -f1)"
 
         echo "=== Extracting ==="
+        # The artifact now holds the release tar.gz (not the raw bundle contents):
+        # unzip it, then untar so $DEST is the bundle root (bin/, lib/, ...).
+        # tar.gz preserves the ROCm symlinks the zip previously dropped.
         if command -v unzip >/dev/null 2>&1; then
-          unzip -q -o "$ZIP" -d "$DEST"
+          unzip -q -o "$ZIP" -d "$WORK/raw"
         else
-          python3 -m zipfile -e "$ZIP" "$DEST"
+          python3 -m zipfile -e "$ZIP" "$WORK/raw"
         fi
         rm -f "$ZIP"   # reclaim space immediately
+        TARBALL=$(find "$WORK/raw" -name '*.tar.gz' | head -n1)
+        [ -n "$TARBALL" ] || { echo "::error::no release archive in gfx1151 artifact"; exit 1; }
+        tar -xzf "$TARBALL" -C "$DEST"
+        rm -rf "$WORK/raw"
         echo "Extracted $(du -sh "$DEST" | cut -f1) to $DEST"
         echo "=== Disk after extract ==="; df -h "$WORK" || true
 
     - name: Restore permissions and ROCm symlinks
       run: |
-        # upload-artifact drops the +x bit and the unversioned .so symlinks the
-        # build created, so rebuild both before running the harness.
+        # upload-artifact's zip wrapper drops the +x bit (but the release tar.gz
+        # already preserved the unversioned .so symlinks), so restore the bits
+        # before running the harness.
         ROOT="${{ runner.temp }}/vllm-qual/vllm"
         # The bundle's Python version is channel-dependent (cp313 stable / cp314
         # nightly); glob it rather than hardcode.
@@ -1096,7 +1111,12 @@ jobs:
         base="${TAG}-x64"
 
         echo "Creating: ${base}.tar.gz"
-        tar -czf "${base}.tar.gz" -C ./artifact .
+        # The build job already produced the release archive (with ROCm symlinks
+        # preserved); reuse it instead of re-tarring the artifact, so the release
+        # asset structure stays identical.
+        src=$(find ./artifact -name '*.tar.gz' | head -n1)
+        [ -n "$src" ] || { echo "::error::no release archive in artifact for ${{ matrix.gfx_target }}"; exit 1; }
+        cp "$src" "${base}.tar.gz"
         size_mb=$(du -m "${base}.tar.gz" | cut -f1)
         echo "Archive size: ${size_mb} MB"
 
