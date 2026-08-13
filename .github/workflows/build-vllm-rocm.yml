@@ -1,3 +1,25 @@
+# ==========================================================================
+# BRANCH-ONLY -- devlab/ephemeral-runner. DO NOT MERGE AS-IS.
+#
+# Proves that an ephemeral, orchestrator-provisioned runner on a Strix Halo
+# can serve this workflow. Four deltas from main, all reverted or made
+# opt-in before any PR:
+#
+#   1/2. build-ubuntu and qualify target the label 'devlab-ephemeral' instead
+#        of the dev_lab runner group. A repo-registered runner lands in the
+#        repo's Default group and can never satisfy `group:`, so the group
+#        constraint has to go for this test. Note this gives up what main's
+#        comment was protecting -- bare [self-hosted, Linux] leaked onto
+#        non-dev_lab boxes -- which is exactly why the replacement is a
+#        specific label and not nothing.
+#   3.   qualify's create_release gate is dropped, because on main the only
+#        way to reach qualify is to also arm create-release.
+#   4.   publish-qualification and create-release are hard-disabled. Both
+#        hold contents:write on a public repo; one pushes the qualification
+#        feed, the other cuts a real tag and release. Neither should fire
+#        from a runner experiment.
+# ==========================================================================
+
 name: Build vLLM + ROCm
 on:
   workflow_dispatch:
@@ -200,9 +222,8 @@ jobs:
     # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
     # here. Build needs only network + pip (no GPU); it shares the box with
     # qualify, which runs after via `needs`.
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    # BRANCH-ONLY: was `group: dev_lab` + [self-hosted, Linux]. See banner.
+    runs-on: [self-hosted, Linux, devlab-ephemeral]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream — qualify/create-release
     # cascade off a skipped build) when this build has already been qualified.
@@ -765,29 +786,19 @@ jobs:
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    # BRANCH-ONLY: was `group: dev_lab` + [self-hosted, Linux]. See banner.
+    runs-on: [self-hosted, Linux, devlab-ephemeral]
     env:
       GFX: gfx1151
     # Runs on release builds AND on omni dispatches (omni is experimental —
     # always qualify it, even as a no-publish dry run; release stays gated on
     # create_release in the create-release job). Skips PRs and dispatches that
     # didn't select gfx1151 (nothing to test → release ungated).
+    # BRANCH-ONLY: create_release gate dropped -- on main it is the only route
+    # to qualify, and it also arms create-release.
     if: >-
       github.event_name != 'pull_request' &&
-      (
-        github.event_name == 'schedule' ||
-        (
-          github.event_name == 'workflow_dispatch' &&
-          contains(github.event.inputs.gfx_target, 'gfx1151') &&
-          (
-            github.event.inputs.create_release == 'true' ||
-            github.event.inputs.create_release == null ||
-            github.event.inputs.omni == 'true'
-          )
-        )
-      )
+      contains(github.event.inputs.gfx_target, 'gfx1151')
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -944,7 +955,8 @@ jobs:
   # GPU box has no gh/git tooling). Contract: docs/qualification-feed.md.
   publish-qualification:
     needs: qualify
-    if: always() && (needs.qualify.result == 'success' || needs.qualify.result == 'failure')
+    # BRANCH-ONLY: disabled. Holds contents:write and pushes the qualification feed.
+    if: false
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -1038,14 +1050,8 @@ jobs:
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
-    if: |
-      always() &&
-      needs.build-ubuntu.result == 'success' &&
-      (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') &&
-      github.event_name != 'pull_request' &&
-      (github.event_name == 'workflow_dispatch' &&
-       (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
-       github.event_name == 'schedule')
+    # BRANCH-ONLY: disabled. Holds contents:write and cuts a real tag/release.
+    if: false
 
     steps:
     - name: Checkout repository
