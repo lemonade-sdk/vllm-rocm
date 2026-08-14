@@ -899,9 +899,9 @@ jobs:
 
     - name: Restore permissions and ROCm symlinks
       run: |
-        # upload-artifact's zip wrapper drops the +x bit (but the release tar.gz
-        # already preserved the unversioned .so symlinks), so restore the bits
-        # before running the harness.
+        # The artifact zip wraps a single tar.gz whose tar -xzf restores modes
+        # and the unversioned .so symlinks, so this is a defensive backstop
+        # (older raw-file artifacts lost +x), not a required repair.
         ROOT="${{ runner.temp }}/vllm-qual/vllm"
         # The bundle's Python version is channel-dependent (cp313 stable / cp314
         # nightly); glob it rather than hardcode.
