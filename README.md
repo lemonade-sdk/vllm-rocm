@@ -9,8 +9,8 @@
 <a href="LICENSE" title="View license">
   <img src="https://img.shields.io/github/license/lemonade-sdk/vllm-rocm?logo=opensourceinitiative&logoColor=white" alt="License" />
 </a>
-<a href="https://github.com/ROCm/ROCm" title="Powered by ROCm 7.12">
-  <img src="https://img.shields.io/badge/ROCm-7.12-blue?logo=amd&logoColor=white" alt="ROCm 7.12" />
+<a href="https://github.com/ROCm/ROCm" title="Powered by ROCm 7.13">
+  <img src="https://img.shields.io/badge/ROCm-7.13-blue?logo=amd&logoColor=white" alt="ROCm 7.13" />
 </a>
 <a href="https://github.com/vllm-project/vllm" title="Powered by vLLM">
   <img src="https://img.shields.io/badge/Powered%20by-vLLM-blue" alt="Powered by vLLM" />
@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/OS-Ubuntu-0078D6?logo=ubuntu&logoColor=white" alt="Platform: Ubuntu" />
 </a>
 
-We provide portable builds of **vLLM** with **AMD ROCm 7.12** acceleration. Each release is a self-contained archive that bundles a relocatable CPython interpreter, vLLM, PyTorch, and all required ROCm user-space libraries as pip packages — no system Python, PyTorch, or ROCm install required. Our automated pipeline targets integration with [**Lemonade**](https://github.com/lemonade-sdk/lemonade).
+We provide portable builds of **vLLM** with **AMD ROCm 7.13** acceleration (the stable channel; the nightly channel tracks newer ROCm). Each release is a self-contained archive that bundles a relocatable CPython interpreter, vLLM, PyTorch, and all required ROCm user-space libraries as pip packages — no system Python, PyTorch, or ROCm install required. Our automated pipeline targets integration with [**Lemonade**](https://github.com/lemonade-sdk/lemonade).
 
 > [!IMPORTANT]
 > **Early Development**: This project is in active development. ROCm support for consumer AMD GPUs (RDNA) in vLLM is experimental. We welcome issue reports and contributions.
@@ -33,16 +33,16 @@ We provide portable builds of **vLLM** with **AMD ROCm 7.12** acceleration. Each
 | **gfx120X** | RDNA4 GPUs | RX 9070 XT, RX 9070, RX 9060 XT, RX 9060 |
 | **gfx110X** | RDNA3 GPUs | RX 7900 XTX/XT/GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT/7600 |
 
-**All builds include ROCm 7.12 user-space built-in** — no separate ROCm installation required. You still need a Linux kernel with a working amdgpu driver for your GPU; for gfx1151 specifically this means kernel 6.18.4+ (see [Lemonade's gfx1151 notes](https://lemonade-server.ai/gfx1151_linux.html)).
+**All builds include the ROCm user-space built-in** — no separate ROCm installation required. You still need a Linux kernel with a working amdgpu driver for your GPU; for gfx1151 specifically this means kernel 6.18.4+ (see [Lemonade's gfx1151 notes](https://lemonade-server.ai/gfx1151_linux.html)).
 
 ## Quick Start
 
-1. **Download** both parts of the build for your GPU from the [latest release](https://github.com/lemonade-sdk/vllm-rocm/releases/latest). Releases are split into `.part00.tar.gz` + `.part01.tar.gz` because each build exceeds GitHub's 2 GB per-asset limit.
+1. **Download** both parts of the build for your GPU from the [latest release](https://github.com/lemonade-sdk/vllm-rocm/releases/latest). Releases are split into `.part01-of-02.tar.gz` + `.part02-of-02.tar.gz` because each build exceeds GitHub's 2 GB per-asset limit.
 2. **Extract** the archive (concatenate the parts and pipe into tar):
    ```bash
    mkdir -p ~/vllm-rocm
-   cat vllm0.19.0-rocm7.12.0-gfx1151-x64.part00.tar.gz \
-       vllm0.19.0-rocm7.12.0-gfx1151-x64.part01.tar.gz \
+   cat vllm0.22.1-rocm7.13.0-gfx1151-x64.part01-of-02.tar.gz \
+       vllm0.22.1-rocm7.13.0-gfx1151-x64.part02-of-02.tar.gz \
      | tar xz -C ~/vllm-rocm
    ```
 3. **Run** the server:
@@ -60,17 +60,17 @@ We provide portable builds of **vLLM** with **AMD ROCm 7.12** acceleration. Each
 
 ## What's Included
 
-Each release archive extracts to a relocatable CPython 3.12 distribution with all deps pre-installed into `site-packages`:
+Each release archive extracts to a relocatable CPython distribution — CPython 3.13 on the stable channel, 3.14 on nightly — with all deps pre-installed into `site-packages` (the tree below shows a 3.13 stable bundle):
 
 ```
 bin/
   vllm-server                 # Launcher shim (sets LD_LIBRARY_PATH, execs api_server)
-  python3.12                  # Bundled CPython interpreter (python-build-standalone)
+  python3.13                  # Bundled CPython interpreter (python-build-standalone)
 lib/
-  libpython3.12.so            # Python runtime
-  python3.12/
+  libpython3.13.so            # Python runtime
+  python3.13/
     site-packages/
-      vllm/                   # pip-installed from wheels.vllm.ai/rocm/
+      vllm/                   # pip-installed from AMD's vLLM index (rocm.frameworks.amd.com/whl/<arch>/)
       torch/                  # pip-installed from repo.amd.com/rocm/whl/<arch>/
       _rocm_sdk_core/lib/     # ROCm core user-space (hip, hsa, comgr, clang, llvm)
       _rocm_sdk_libraries_gfx<arch>/lib/
@@ -78,16 +78,16 @@ lib/
       transformers/, numpy/, ...  # Python deps
 ```
 
-The top-level `lib/` holds the Python stdlib and `libpython3.12.so`; ROCm libraries (e.g. `libamdhip64.so`, `librocblas.so`) live under the bundled site-packages. The `bin/vllm-server` shim puts those directories on `LD_LIBRARY_PATH` before exec-ing `python3 -m vllm.entrypoints.openai.api_server`.
+The top-level `lib/` holds the Python stdlib and `libpython3.NN.so`; ROCm libraries (e.g. `libamdhip64.so`, `librocblas.so`) live under the bundled site-packages. The `bin/vllm-server` shim puts those directories on `LD_LIBRARY_PATH` before exec-ing `python3 -m vllm.entrypoints.openai.api_server`.
 
 ## Automated Builds
 
 Our GitHub Actions workflow:
-- Downloads a relocatable **CPython 3.12** from [`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone)
-- Installs **PyTorch ROCm** from AMD's pip index (`https://repo.amd.com/rocm/whl/<target>/`)
-- Installs **vLLM ROCm** (pre-built wheel) from AMD's vLLM wheel index (`https://wheels.vllm.ai/rocm/`), which pulls the matching `rocm-sdk-core` and `rocm-sdk-libraries-gfx<target>` wheels as transitive deps
+- Downloads a relocatable **CPython** from [`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone) (3.13 for the stable channel, 3.14 for nightly)
+- Installs **PyTorch ROCm** from AMD's pip index (`https://repo.amd.com/rocm/whl/<target>/` for stable; `https://rocm.nightlies.amd.com/whl-multi-arch` for nightly)
+- Installs **vLLM ROCm** (pre-built wheel) from AMD's vLLM wheel index (`https://rocm.frameworks.amd.com/whl/<target>/` for stable; `https://rocm.frameworks-nightlies.amd.com/whl/device-all-rdna` for nightly), which pulls the matching `rocm-sdk-core` and `rocm-sdk-libraries-gfx<target>` wheels as transitive deps
 - Generates a `bin/vllm-server` shim that wires up `LD_LIBRARY_PATH` / `PYTHONPATH` at startup
-- Runs a **15-test qualification** on the **gfx1151** build on self-hosted AMD GPU hardware (Strix Halo) — Tier 0 static bundle checks, Tier 1 hardware smoke, Tier 2 functional inference — aggregates the results into a qualification report, and gates all releases on the build being promotable (see [`scripts/qualify`](scripts/qualify/README.md))
+- Runs a **16-test qualification** on the **gfx1151** build on self-hosted AMD GPU hardware (Strix Halo) — Tier 0 static bundle checks, Tier 1 hardware smoke, Tier 2 functional inference — aggregates the results into a qualification report, and gates all releases on the build being promotable (see [`scripts/qualify`](scripts/qualify/README.md))
 - Tars the result, splits it into `< 2 GB` parts, and publishes the release
 
 | GPU Target | Ubuntu |
@@ -123,10 +123,10 @@ device 0 (the upstream defaults target multi-GPU hosts).
 ## Dependencies
 
 ### Runtime (bundled in the release)
-- **[vLLM](https://github.com/vllm-project/vllm)** — high-throughput LLM serving engine (ROCm wheel from `wheels.vllm.ai/rocm/`)
-- **[PyTorch](https://pytorch.org/)** — tensor compute (ROCm wheel from `repo.amd.com/rocm/whl/<target>/`)
+- **[vLLM](https://github.com/vllm-project/vllm)** — high-throughput LLM serving engine (ROCm wheel from AMD's `rocm.frameworks.amd.com` / `rocm.frameworks-nightlies.amd.com` index)
+- **[PyTorch](https://pytorch.org/)** — tensor compute (ROCm wheel from `repo.amd.com/rocm/whl/<target>/` / `rocm.nightlies.amd.com/whl-multi-arch`)
 - **[ROCm SDK wheels](https://github.com/ROCm/TheRock)** — AMD's pip-packaged ROCm user-space (`rocm-sdk-core`, `rocm-sdk-libraries-gfx<target>`, published alongside via [TheRock](https://github.com/ROCm/TheRock))
-- **[python-build-standalone](https://github.com/astral-sh/python-build-standalone)** — relocatable CPython 3.12
+- **[python-build-standalone](https://github.com/astral-sh/python-build-standalone)** — relocatable CPython (3.13 stable / 3.14 nightly)
 
 ### Build (CI only)
 - **Ubuntu 22.04** GitHub Actions runner
