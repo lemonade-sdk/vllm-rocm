@@ -69,12 +69,12 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
       "vllm_version": "0.22.1+rocm722",
       "torch_version": "2.11.0+rocm7.13.0",
       "rocm_version": "7.13.0",
-      "tests": { "passed": 8, "failed": 8, "warned": 0, "skipped": 0, "total": 16 },
+      "tests": { "passed": 7, "failed": 8, "warned": 0, "skipped": 0, "total": 15 },
       "qualified": false,                      // == promoted; "did it qualify to release"
       "overall": "fail",                       // pass | fail | warn
       "blocked_by": ["tier0=fail", "tier1=fail", "tier2 missing"],
-      "results": {                             // per-test status across the 16-test suite
-        "T0.1": "fail", "T0.2": "fail", "T0.3": "pass", "T0.4": "pass", "T0.5": "pass", "T0.6": "pass",
+      "results": {                             // per-test status across the 15-test suite
+        "T0.1": "fail", "T0.2": "fail", "T0.3": "pass", "T0.4": "pass", "T0.6": "pass",
         "T1.1": "fail", "T1.2": "pass", "T1.3": "pass", "T1.4": "pass", "T1.5": "pass",
         "T2.1": "missing", "T2.2": "missing", "T2.3": "missing", "T2.4": "missing", "T2.5": "missing"
       },
@@ -92,13 +92,22 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
 
 ### Field notes
 
-- **`tests.total` is always 16** (the canonical suite). A tier that produced no
-  fragment (e.g. Tier 2 when the server failed to boot) has its tests marked
-  `"missing"` in `results` and **counted as `failed`**. So `passed + failed +
-  warned + skipped == 16` always, and the counts never look misleadingly small.
+- **`tests.total` is always 15** (the canonical *published* suite — see "16 run,
+  15 published" below). A tier that produced no fragment (e.g. Tier 2 when the
+  server failed to boot) has its tests marked `"missing"` in `results` and
+  **counted as `failed`**. So `passed + failed + warned + skipped == 15` always,
+  and the counts never look misleadingly small.
 - **`results`** values are one of `pass | fail | warn | skip | missing`. Test ids are
-  the canonical 16: T0.1–T0.6, T1.1–T1.5, T2.1–T2.5. This lets the dashboard
+  the canonical 15: T0.1–T0.4, T0.6, T1.1–T1.5, T2.1–T2.5. This lets the dashboard
   compute failure-frequency and heatmap views from `index.json` alone (no N+1 fetch).
+- **16 run, 15 published.** The `qualify` job *executes* 16 checks — Tier 0 runs
+  T0.1–T0.6. `scripts/publish_qualification.py` folds **T0.5** (the `.kpack`
+  code-object-pack check) out of the published feed, so the dashboard contract is a
+  fixed **15**-test suite. T0.5 still runs and still **gates** the build (a T0.5
+  failure fails `qualify` and blocks the release) — it is simply not surfaced in the
+  feed's per-test `results` map. Separately, on the **nightly** channel **T0.1**
+  reports `skip` (the universal-RDNA vLLM wheel declares no `Requires-Dist: torch`,
+  so there is no pin to check); on **stable** T0.1 is a real pass/fail.
 - **`qualified`** is the release gate (`true` only if every required tier passed).
 - **`report_url`** is relative to the feed base — open it for the full per-test
   detail (errors, unresolved symbols, timings).

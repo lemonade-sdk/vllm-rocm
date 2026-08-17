@@ -14,10 +14,19 @@ the `qualification-data` branch feed (`qualification/index.json`; see
 | 1 smoke | gfx1151 self-hosted | native ext won't dlopen, platform import crash, GPU not visible | yes |
 | 2 inference | gfx1151 self-hosted | server won't boot, broken Triton JIT, dead endpoints | yes |
 
-The suite is **16 tests**: 
+The `qualify` job **runs 16 tests**:
 - Tier 0 static (T0.1–T0.6, 6) + 
 - Tier 1 hardware smoke (T1.1–T1.5, 5) + 
 - Tier 2 functional inference (T2.1–T2.5, 5).
+
+> **16 run, 15 published.** The published dashboard feed reports a fixed **15**:
+> [`scripts/publish_qualification.py`](../publish_qualification.py) folds **T0.5**
+> (the `.kpack` code-object-pack check) out of the per-test `results` map. T0.5 still
+> runs and still **gates** (a T0.5 failure fails the job and blocks the release) — it
+> just isn't surfaced in the feed. Separately, **T0.1** reports `skip` on the
+> **nightly** channel (the universal-RDNA wheel declares no `Requires-Dist: torch`,
+> so there's no pin to check); on **stable** it's a real check. See
+> [`../../docs/qualification-feed.md`](../../docs/qualification-feed.md).
 
 The three tiers all run in the single `qualify` job on the gfx1151 box; `aggregate.py
 --require-tiers tier0,tier1,tier2 --fail-on-no-promote` is the one gate that

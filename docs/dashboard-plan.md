@@ -6,7 +6,7 @@ consumes is [`qualification-feed.md`](qualification-feed.md).
 
 ## What it answers
 
-For each build: **how many of the 16 tests passed/failed, and did the build qualify to
+For each build: **how many of the 15 tests passed/failed, and did the build qualify to
 release?** — plus the trend of that over time, and which tests fail most often.
 
 ## Data source
@@ -24,12 +24,12 @@ dashboard is a pure consumer — it never writes back.
 
 | View | Type | Reads (from `index.json`) |
 |------|------|----------------------------|
-| **Fleet status tiles** (per target) | status card: qualified ✓/✗, `8/16`, version | `latest/<target>.json` (or newest entry per `gfx_target`) |
+| **Fleet status tiles** (per target) | status card: qualified ✓/✗, `8/15`, version | `latest/<target>.json` (or newest entry per `gfx_target`) |
 | **Qualification rate over time** | line / % | `qualified` + `generated_at` bucketed by day/week |
 | **Pass/fail per build** | stacked bar, time x-axis | `tests.{passed,failed,warned,skipped}` |
 | **Trend annotated with versions** | line + markers | above + `vllm_version` / `torch_version` change points |
 | **Failure Pareto** (which tests fail most) | horizontal bar | `results` aggregated across builds → fail-count per test id |
-| **Tier heatmap** (builds × 16 tests) | grid | `results` per build |
+| **Tier heatmap** (builds × 15 tests) | grid | `results` per build |
 | **Build drill-down** | detail panel | `report_url` → full report (`tiers[].tests[].error/details`) |
 
 The first four need only the compact counts; the failure-analysis views need the
@@ -43,10 +43,10 @@ report).
 │  vLLM-ROCm Build Qualification                          gfx1151 ▾  │
 ├───────────────┬───────────────┬───────────────┬──────────────────┤
 │ gfx1151  ✗    │ gfx1150  —    │ gfx120X  —    │ gfx110X  —       │  tiles: latest/
-│ 8/16  not qual│ no hw test    │ no hw test    │ no hw test       │
+│ 8/15  not qual│ no hw test    │ no hw test    │ no hw test       │
 ├───────────────┴───────────────┴───────────────┴──────────────────┤
 │  Qualification rate (30d)            │  Pass/fail per build       │
-│  100% ┤      ╭─╮                     │  16 ┤ █▆ █ ▆█ ▆▆█ ▂        │  index.builds[]
+│  100% ┤      ╭─╮                     │  15 ┤ █▆ █ ▆█ ▆▆█ ▂        │  index.builds[]
 │   50% ┤ ╭──╮ │ ╰──╴                  │     ┤ ▂▂ ▂ ▂▂ ▂▂▂ █        │
 │    0% ┼─╯  ╰─╯                       │     └────────────────────  │
 ├──────────────────────────────────────────────────────────────────┤
@@ -73,8 +73,10 @@ report).
   "passing". Don't imply green where there's no data.
 - A **single build is one point** — trend views need history to accumulate on the
   branch before they're meaningful.
-- `total` is always 16 and **`missing` counts as failed**, so a crashed tier reads as
-  red, never as a smaller-but-green total.
+- `total` is always 15 (the published suite; the `qualify` job runs 16 but T0.5 is
+  folded out of the feed — see [`qualification-feed.md`](qualification-feed.md)) and
+  **`missing` counts as failed**, so a crashed tier reads as red, never as a
+  smaller-but-green total.
 
 ## Not in scope here
 
