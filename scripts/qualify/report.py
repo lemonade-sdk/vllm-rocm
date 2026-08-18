@@ -2,10 +2,11 @@
 """
 Shared reporting for the vLLM-ROCm build qualification suite.
 
-Every qualification tier (tier0 static, tier1 smoke, tier2 inference, tier3
-lemonade integration) emits a JSON *fragment* with an identical schema. A
-later aggregation step merges the per-tier fragments for one build target into
-a single qualification record.
+Every qualification tier that runs in this repo (tier0 static, tier1 smoke,
+tier2 inference) emits a JSON *fragment* with an identical schema. A later aggregation step merges the per-tier
+fragments for one build target into a single qualification record.
+  - Tier 3, Lemonade integration, is intentionally not run here.
+  - Lemonade validates that on adoption via its own gate.
 
 The schema is intentionally flat and stable so it can be consumed directly by a
 downstream dashboard:
@@ -41,7 +42,6 @@ TIER_NAMES = {
     "tier0": "Static bundle verification",
     "tier1": "Hardware smoke",
     "tier2": "Standalone functional inference",
-    "tier3": "Lemonade integration",
 }
 
 

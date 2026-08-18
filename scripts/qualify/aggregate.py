@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Aggregate per-tier fragments for one build target into a qualification record,
-decide whether the target may be promoted from prerelease to a full release,
-append the record to the durable JSONL ledger, and emit a GitHub Step Summary.
+decide whether the target qualifies to be released, optionally append the
+record to a local JSONL ledger, and emit a GitHub Step Summary.
 
 The qualification record is the unit a downstream dashboard consumes: one JSON
 object per (build, target) with a top-level rollup plus every tier's full test
