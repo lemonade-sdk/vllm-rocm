@@ -190,19 +190,25 @@ jobs:
         echo "Generated matrix: $matrix_targets"
 
   build-ubuntu:
-    # Target the dev_lab runner GROUP explicitly, not just labels. The org's
-    # Default group is visibility:all, so a bare [self-hosted, Linux] also
-    # matches Linux boxes in other groups (stx / sjlab / Default) the repo can
-    # see — runs landed on a non-dev_lab box. `group: dev_lab` + the Linux label
-    # selects only the dev_lab Linux box (currently ta-devlab-halo-03) with no
-    # name-pin, so it survives re-image/rename as long as the box stays in the
-    # group. AMD's frameworks-nightlies host allowlists these boxes' egress but
-    # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
-    # here. Build needs only network + pip (no GPU); it shares the box with
-    # qualify, which runs after via `needs`.
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    # Select the DevLab pool by a specific label, not by runner group. The
+    # problem the group solved is real — the org's Default group is
+    # visibility:all, so a bare [self-hosted, Linux] also matches Linux boxes in
+    # other groups (stx / sjlab / Default) the repo can see, and runs did land
+    # on a non-dev_lab box. A label the DevLab machines alone carry solves it the
+    # same way, and does it without an org-admin grant: `group:` can only be
+    # managed at the org level, whereas a label travels with the runner at
+    # registration.
+    #
+    # 'devlab-ephemeral' means exactly that: a DevLab box, provisioned per job.
+    # The runner is registered when this job is picked up and unregistered when
+    # it finishes, so nothing carries between runs. Nothing here is pinned to a
+    # machine name, so the pool can grow, be re-imaged or be renamed freely.
+    #
+    # AMD's frameworks-nightlies host allowlists these boxes' egress but 403s
+    # GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched here.
+    # Build needs only network + pip (no GPU); it shares the pool with qualify,
+    # which runs after via `needs`.
+    runs-on: [self-hosted, Linux, devlab-ephemeral]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream — qualify/create-release
     # cascade off a skipped build) when this build has already been qualified.
@@ -256,7 +262,9 @@ jobs:
         echo "channel=$CHANNEL -> Python $PBS_PY (cp${PYVER/./})"
         echo "Downloading portable Python from $PBS_URL"
         # Build under the runner's temp dir — no sudo, no shared-box pollution,
-        # and isolated per run (the self-hosted boxes are persistent). VLLM_ROOT
+        # and isolated per run. Belt and braces on the DevLab pool, where the
+        # runner is ephemeral and the tree is gone at teardown anyway; still
+        # load-bearing on any persistent runner this workflow lands on. VLLM_ROOT
         # is exported so every later step (and the artifact upload) uses it.
         ROOT="$RUNNER_TEMP/vllm-build/vllm"
         rm -rf "$RUNNER_TEMP/vllm-build"
@@ -756,18 +764,23 @@ jobs:
         # No sudo — it's under the runner's temp dir. Free the box for the next run.
         rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 16-test qualification on the dev_lab Linux gfx1151 box. Targets the dev_lab
-  # runner GROUP (not just labels) so it can't land on a Linux box in another
-  # group the repo can also see (Default is visibility:all) — see build-ubuntu.
+  # 16-test qualification on a DevLab Linux gfx1151 box. Selected by the
+  # 'devlab-ephemeral' label rather than the dev_lab runner group, so it still
+  # cannot land on a Linux box in another group the repo can see (Default is
+  # visibility:all) — see build-ubuntu for the full reasoning.
+  #
+  # This job needs the GPU, and every machine carrying 'devlab-ephemeral' today
+  # is a Strix Halo (gfx1151), which is what GFX below assumes. If the pool ever
+  # takes on a Linux box with different silicon, add the architecture as a
+  # second label here rather than pinning a machine name.
+  #
   # Runs the scripts/qualify harness against the built bundle:
   #   tier0 static (6) + tier1 hardware smoke (5) + tier2 functional inference (5)
   # = 16 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: build-ubuntu
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, devlab-ephemeral]
     env:
       GFX: gfx1151
     # Runs on release builds AND on omni dispatches (omni is experimental —
