@@ -1,10 +1,11 @@
 # Build qualification suite
 
-Tiered tests that gate a vllm-rocm build before its release tag is promoted from
-`prerelease` to a full release. Each tier emits a dashboard-friendly JSON
-fragment; `aggregate.py` merges them into one qualification record per build
-target, decides promotion, and appends the record to the `build-results` branch
-ledger (`results/ledger.jsonl`).
+Tiered tests that gate whether a vllm-rocm build is published at all: a build is
+released only when its required tiers pass. On green, the release flag is set by
+channel — **stable** → `--latest`, **nightly**/**omni** → `--prerelease`. Each
+tier emits a dashboard-friendly JSON fragment; `aggregate.py` merges them into
+one qualification record per build target, decides whether it qualifies, and
+appends the record to the `build-results` branch ledger (`results/ledger.jsonl`).
 
 | Tier | Where it runs | Catches | Gating |
 |------|---------------|---------|--------|
@@ -21,19 +22,25 @@ are recorded `hardware_validated: false`.
 
 `channel` is a **run-level** parameter (not a matrix axis) — stable and nightly
 have different triggers and different upstream sources, so they run as separate
-workflow runs. The qualification suite is identical for both, and **both promote
-only on green**.
+workflow runs. The qualification suite is identical for both, and **both publish
+only on green**. Tags carry **no channel suffix** (they are per-gfx-target only,
+e.g. `vllm0.22.1-rocm7.13.0-gfx1151`); the channel is distinguished by the
+GitHub release flag instead — stable is `--latest`, nightly/omni are
+`--prerelease`. This is what lets Lemonade's auto-bump keep the pins apart
+without parsing tags.
 
-| Channel | Source | Tag suffix | Notes |
+| Channel | Source | Release flag | Notes |
 |---------|--------|-----------|-------|
-| **stable** | AMD's matched vLLM + PyTorch (`rocm.frameworks.amd.com` + `repo.amd.com`) | `…-stable` | self-consistent; lags upstream vLLM |
-| **nightly** | latest vLLM (`wheels.vllm.ai/rocm`) + latest AMD ROCm PyTorch | `…-nightly` | bleeding edge; may be red when latest+latest are ABI-incompatible — reported, never patched |
+| **stable** | AMD's matched vLLM + PyTorch (`rocm.frameworks.amd.com` + `repo.amd.com`) | `--latest` | self-consistent; lags upstream vLLM |
+| **nightly** | latest vLLM (`wheels.vllm.ai/rocm`) + latest AMD ROCm PyTorch | `--prerelease` | bleeding edge; may be red when latest+latest are ABI-incompatible — reported, never patched |
 
 Every qualification record carries `build.channel`, so the dashboard can show a
-stable column and a nightly column per target. Consumers select a channel by tag
-suffix (`…-stable` / `…-nightly`), **not** GitHub's single "latest" pointer
-(which can't represent two channels), mirroring lemonade's
-`vllm.rocm-stable` / `vllm.rocm-nightly` keys.
+stable column and a nightly column per target. Consumers select a channel by the
+GitHub **release flag** — stable is the repo's `latest` full release, nightly is
+the newest non-omni prerelease — **not** by tag suffix (tags are per-gfx-target
+only). This maps onto lemonade's `vllm.rocm-stable` / `vllm.rocm-nightly` keys:
+its auto-bump reads `/releases/latest` for the stable pin and the newest
+non-omni prerelease for the nightly pin.
 
 ## What each tier looks for
 
@@ -106,8 +113,9 @@ allowed to call it:
    fast first pass set `gfx_target = gfx1151` and `create_release = true`.
    Scheduled runs default to `nightly`; `stable` is run on an AMD release (or
    manual dispatch with `channel=stable`).
-3. Flow: `build-ubuntu` → Tier 0 → `publish-prerelease` → `hw-qualify`
-   (Tier 1+2) → `tier3` (lemonade) → `aggregate` (promote on pass) → `ledger`.
+3. Flow: `build-ubuntu` → Tier 0 → `hw-qualify` (Tier 1+2) → `aggregate`
+   (`--fail-on-no-promote` gates the job) → **Create Release** (stable →
+   `--latest`, nightly/omni → `--prerelease`) → `ledger`.
 4. Review: the per-job **Step Summary** table, the `qualification-record-*`
    artifact, and `results/ledger.jsonl` on the `build-results` branch.
 
