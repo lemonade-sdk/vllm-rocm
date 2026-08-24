@@ -822,10 +822,28 @@ jobs:
         bash -n $VLLM_ROOT/bin/vllm-server
         # Execute one REWRITTEN console script for real -- python3 -c above runs
         # the interpreter directly and bash -n checks the untouched wrapper, so
-        # neither would notice all ~105 rewritten scripts being dead. This
+        # neither would notice all ~113 rewritten scripts being dead. This
         # exercises the sh trampoline end-to-end (a full sh -n cannot: sh parses
         # a polyglot past the exec line into the Python body).
-        "$VLLM_ROOT/bin/pip" --version
+        #
+        # Pick the probe at runtime rather than hardcoding a name: the Strip step
+        # removes $SP/pip* (and build_omni_layer.sh re-strips it), so bin/pip is a
+        # DANGLING console script -- probing it fails with ModuleNotFoundError on
+        # every build, which says nothing about the trampoline. Candidates below
+        # are ordered by how certain their module is to survive the strip; torch
+        # and vllm are the bundle's reason to exist and are never trimmed.
+        probe=""
+        for cand in torchrun vllm isympy f2py normalizer; do
+          [ -x "$VLLM_ROOT/bin/$cand" ] || continue
+          # Confirm the module behind it survived the strip before relying on it.
+          if "$VLLM_ROOT/bin/$cand" --help >/dev/null 2>&1; then probe="$cand"; break; fi
+        done
+        if [ -z "$probe" ]; then
+          echo "::error::no rewritten console script could be executed -- the sh trampoline may be broken"
+          ls -1 "$VLLM_ROOT/bin" | head -40
+          exit 1
+        fi
+        echo "trampoline probe OK: bin/$probe launched the bundled interpreter"
         echo "All sanity checks passed"
 
     - name: Report final size
