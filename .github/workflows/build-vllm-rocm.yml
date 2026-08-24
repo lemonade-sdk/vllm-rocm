@@ -467,13 +467,22 @@ jobs:
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
             echo "omni: pinning base to $VLLM_VER (stamp $ROCM_STAMP)"
           fi
-          # upstream vLLM 0.25.x pins torch 2.12.0 (the wheel itself strips it);
-          # bump TORCH_VER here when vLLM bumps its torch requirement — and
-          # TV_VER with it: torchvision pairs strictly with torch (used by the
-          # repair step below) or torchvision::nms fails to register and
-          # `import vllm` dies. The omni base (0.25.x) shares this ABI.
-          TORCH_VER=2.12.0
-          TV_VER=0.27.0
+          # The torch ABI follows the vLLM WHEEL'S VERSION, so key the pin on
+          # $VLLM_VER (resolved above, after the omni override) — not on the
+          # nightly line. AMD advances its two lines independently: RDNA is on
+          # 0.25.x (torch 2.12 ABI) while CDNA is still on 0.23.1 (torch 2.11
+          # ABI), and whl-multi-arch carries BOTH torch builds at the same ROCm
+          # stamp, so a single global pin resolves and installs cleanly and then
+          # dies in qualify with unresolved torch::Library::_def symbols.
+          # Keying on the line (device-all-cdna -> 2.11) would fix today and
+          # silently re-break the day AMD moves CDNA to 0.25.x; keying on the
+          # version self-corrects. TV_VER moves with TORCH_VER — torchvision
+          # pairs strictly with torch (used by the repair step below) or
+          # torchvision::nms fails to register and `import vllm` dies.
+          case "$VLLM_VER" in
+            0.2[0-4].*) TORCH_VER=2.11.0; TV_VER=0.26.0 ;;
+            *)          TORCH_VER=2.12.0; TV_VER=0.27.0 ;;
+          esac
           echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
