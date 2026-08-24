@@ -97,9 +97,7 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
   `"missing"` in `results` and **counted as `failed`**. So `passed + failed +
   warned + skipped == 16` always, and the counts never look misleadingly small.
 - **`results`** values are one of `pass | fail | warn | skip | missing`. Test ids are
-  the canonical 16: T0.1–T0.6, T1.1–T1.5, T2.1–T2.5. T0.5 (gfx code-object packs
-  present) is a gating tier-0 check, so it appears in `results` and a red T0.5 shows
-  as a failed cell rather than hiding behind an all-green tier-0 row. This lets the dashboard
+  the canonical 16: T0.1–T0.6, T1.1–T1.5, T2.1–T2.5. This lets the dashboard
   compute failure-frequency and heatmap views from `index.json` alone (no N+1 fetch).
 - **`qualified`** is the release gate (`true` only if every required tier passed).
 - **`report_url`** is relative to the feed base — open it for the full per-test
