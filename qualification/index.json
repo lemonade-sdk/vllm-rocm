@@ -1,7 +1,65 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-24T19:19:36Z",
+  "updated_at": "2026-08-24T19:29:51Z",
   "builds": [
+    {
+      "build_id": "32767644728-gfx1151-nightly",
+      "tag": "vllm0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "nightly",
+      "generated_at": "2026-08-24T19:29:51Z",
+      "run_id": "32767644728",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/32767644728",
+      "vllm_version": "0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724",
+      "torch_version": "2.11.0+rocm7.15.0a20260724",
+      "rocm_version": "7.15.0",
+      "tests": {
+        "passed": 8,
+        "failed": 6,
+        "warned": 0,
+        "skipped": 1,
+        "total": 15
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier0=fail",
+        "tier1=fail",
+        "tier2=fail"
+      ],
+      "summary": {
+        "title": "torch::Library ABI mismatch in ROCm 7.15.0 native extensions",
+        "recommended_action": "Rebuild vLLM 0.25.2.dev0 native extensions against PyTorch 2.11.0+rocm7.15.0a20260724 using ROCm 7.15.0, ensuring the wheel's compiled _C.abi3.so and _rocm_C.abi3.so match the linked torch library ABI.",
+        "blocking_tests": [
+          "T0.2",
+          "T1.1",
+          "T2.2",
+          "T2.3",
+          "T2.4",
+          "T2.5"
+        ],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "skip",
+        "T0.2": "fail",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.6": "pass",
+        "T1.1": "fail",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "pass",
+        "T2.1": "pass",
+        "T2.2": "fail",
+        "T2.3": "fail",
+        "T2.4": "fail",
+        "T2.5": "fail"
+      },
+      "report_url": "reports/32767644728-gfx1151-nightly.json"
+    },
     {
       "build_id": "32765946619-gfx1151-nightly",
       "tag": "vllm-omni0.23.0rc1-gfx1151",
