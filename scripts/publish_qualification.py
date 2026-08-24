@@ -11,7 +11,7 @@ and writes, under --data-dir (the `qualification/` dir on the data branch):
 
 The index entry is keyed by build_id, so re-running this for the same build is
 an idempotent upsert (no duplicate rows/files). Counts are normalized to the
-canonical 15-test suite: a tier that produced no fragment (e.g. Tier 2 when the
+canonical 16-test suite: a tier that produced no fragment (e.g. Tier 2 when the
 server failed to boot) has its tests marked "missing" and folded into `failed`,
 so the dashboard never shows a misleadingly small total.
 
@@ -23,13 +23,13 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-# The canonical 15-test suite. Tier 0 intentionally skips T0.5.
+# The canonical 16-test suite, mirroring exactly what the tier runners execute.
 TIER_TESTS = {
-    "tier0": ["T0.1", "T0.2", "T0.3", "T0.4", "T0.6"],
+    "tier0": ["T0.1", "T0.2", "T0.3", "T0.4", "T0.5", "T0.6"],
     "tier1": ["T1.1", "T1.2", "T1.3", "T1.4", "T1.5"],
     "tier2": ["T2.1", "T2.2", "T2.3", "T2.4", "T2.5"],
 }
-TOTAL_TESTS = sum(len(v) for v in TIER_TESTS.values())  # 15
+TOTAL_TESTS = sum(len(v) for v in TIER_TESTS.values())  # 16
 
 
 def _int(v):

@@ -61,13 +61,13 @@ env:
   # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
   # (see scripts/build_omni_layer.sh). Off for normal nightly/stable runs.
   OMNI: ${{ github.event.inputs.omni || (github.event.schedule == '30 16 * * *') || 'false' }}
-  # Qualified base the omni layer builds on. vLLM-Omni 0.23.0rc1 does NOT support
-  # the bleeding-edge nightly base (its transformers 5.13 breaks ming.py's
-  # AutoFeatureExtractor.register; numpy 2.5 breaks numba/openai-whisper), so
-  # omni builds pin this validated base instead of tracking the latest nightly.
-  # Bump when a newer vLLM-Omni supports a newer base. (Used in the nightly
-  # install step below.)
-  OMNI_BASE_VLLM_VER: "0.23.1.dev0+rocm7.14.0a20260624.g0fc695fc6.d20260625"
+  # Qualified base the omni layer builds on: detect-omni resolves the newest
+  # vllm-omni release matching this base's major.minor from PyPI (0.25.x ->
+  # vllm-omni 0.25.0rc1). Pinned to a base that passed full qualification
+  # (run 31541098026) rather than tracking the latest nightly; bump when a
+  # newer base qualifies AND a matching vllm-omni release exists. (Used in
+  # the nightly install step below.)
+  OMNI_BASE_VLLM_VER: "0.25.2.dev0+rocm7.15.0a20260724.g752a3a504.d20260724"
 
 jobs:
   # Decide whether AMD has published a nightly vLLM wheel we have not already
@@ -441,9 +441,22 @@ jobs:
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
             echo "omni: pinning base to $VLLM_VER (stamp $ROCM_STAMP)"
           fi
-          # upstream vLLM 0.21.x pins torch 2.11.0 (the wheel itself strips it);
-          # bump TORCH_VER here when vLLM bumps its torch requirement.
-          TORCH_VER=2.11.0
+          # The torch ABI follows the vLLM WHEEL'S VERSION, so key the pin on
+          # $VLLM_VER (resolved above, after the omni override) — not on the
+          # nightly line. AMD advances its two lines independently: RDNA is on
+          # 0.25.x (torch 2.12 ABI) while CDNA is still on 0.23.1 (torch 2.11
+          # ABI), and whl-multi-arch carries BOTH torch builds at the same ROCm
+          # stamp, so a single global pin resolves and installs cleanly and then
+          # dies in qualify with unresolved torch::Library::_def symbols.
+          # Keying on the line (device-all-cdna -> 2.11) would fix today and
+          # silently re-break the day AMD moves CDNA to 0.25.x; keying on the
+          # version self-corrects. TV_VER moves with TORCH_VER — torchvision
+          # pairs strictly with torch (used by the repair step below) or
+          # torchvision::nms fails to register and `import vllm` dies.
+          case "$VLLM_VER" in
+            0.2[0-4].*) TORCH_VER=2.11.0; TV_VER=0.26.0 ;;
+            *)          TORCH_VER=2.12.0; TV_VER=0.27.0 ;;
+          esac
           echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
@@ -498,9 +511,8 @@ jobs:
           #    torchvision must match the ROCm torch ABI or its C++ ops
           #    (torchvision::nms) fail to register and `import vllm` dies. Legacy
           #    pulled a PyPI torchvision built against a different torch; force the
-          #    matched ROCm build from the nightly index, same rocm stamp. torch
-          #    2.11 pairs with torchvision 0.26 — bump TV_VER with TORCH_VER.
-          TV_VER=0.26.0
+          #    matched ROCm build from the nightly index, same rocm stamp.
+          #    TV_VER is set alongside TORCH_VER above — they pair strictly.
           $VLLM_ROOT/bin/pip install --index-url "$NIGHTLY_TORCH" \
             --extra-index-url https://pypi.org/simple/ \
             "torchvision==${TV_VER}+${ROCM_STAMP}"
@@ -823,19 +835,25 @@ jobs:
         echo ""
         du -sh $VLLM_ROOT/*/ 2>/dev/null
 
+    - name: Create release archive
+      run: |
+        # tar.gz preserves the ROCm symlinks (upload-artifact's zip expands each
+        # symlink into a full copy of its target, bloating the artifact). tar
+        # also keeps the hidden per-gfx GPU code-object dirs (torch/.kpack/,
+        # _rocm_sdk_*/.kpack/, .devel_links/) that ROCm wheels ship, so
+        # include-hidden-files is no longer needed.
+        ARCHIVE="$RUNNER_TEMP/vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64.tar.gz"
+        tar -czf "$ARCHIVE" -C "$VLLM_ROOT" .
+        echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+        echo "Created $(du -h "$ARCHIVE" | cut -f1) archive"
+
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: vllm-ubuntu-rocm-${{ matrix.gfx_target }}-x64
-        path: ${{ env.VLLM_ROOT }}/
-        # CRITICAL: the AMD ROCm wheels ship the per-gfx GPU code objects in
-        # HIDDEN dot-dirs (torch/.kpack/torch_gfx1151.kpack,
-        # _rocm_sdk_libraries/.kpack/{blas,fft,rand,rccl}_lib_gfx1151.kpack,
-        # .devel_links/). Since v4, upload-artifact EXCLUDES hidden files by
-        # default — dropping these silently produces a bundle that loads and
-        # enumerates the GPU but dies on the first kernel launch with
-        # hipErrorInvalidImage. include-hidden-files keeps them. Do not remove.
-        include-hidden-files: true
+        # Upload the intermediate tar.gz (not the raw bundle), so the artifact
+        # preserves symlinks and the hidden per-gfx code-object dirs on download.
+        path: ${{ env.ARCHIVE }}
         retention-days: 30
         compression-level: 6
 
@@ -913,7 +931,8 @@ jobs:
 
         # The build artifact is ~3.3 GB (extracts to ~11 GB). actions/download-artifact@v4
         # is unreliable for artifacts this size on self-hosted runners, so pull the
-        # artifact zip directly with curl (streams to disk, resumable) and unzip it.
+        # artifact zip directly with curl (streams to disk, resumable), unzip it to
+        # recover the release tar.gz, then untar it below.
         # Resolve the artifact id via the REST API with curl + python3 — the box
         # does not have the gh CLI installed.
         ART_ID=$(curl -fsSL \
@@ -947,19 +966,27 @@ jobs:
         echo "Downloaded zip: $(du -h "$ZIP" | cut -f1)"
 
         echo "=== Extracting ==="
+        # The artifact now holds the release tar.gz (not the raw bundle contents):
+        # unzip it, then untar so $DEST is the bundle root (bin/, lib/, ...).
+        # tar.gz preserves the ROCm symlinks the zip previously dropped.
         if command -v unzip >/dev/null 2>&1; then
-          unzip -q -o "$ZIP" -d "$DEST"
+          unzip -q -o "$ZIP" -d "$WORK/raw"
         else
-          python3 -m zipfile -e "$ZIP" "$DEST"
+          python3 -m zipfile -e "$ZIP" "$WORK/raw"
         fi
         rm -f "$ZIP"   # reclaim space immediately
+        TARBALL=$(find "$WORK/raw" -name '*.tar.gz' | head -n1)
+        [ -n "$TARBALL" ] || { echo "::error::no release archive in gfx1151 artifact"; exit 1; }
+        tar -xzf "$TARBALL" -C "$DEST"
+        rm -rf "$WORK/raw"
         echo "Extracted $(du -sh "$DEST" | cut -f1) to $DEST"
         echo "=== Disk after extract ==="; df -h "$WORK" || true
 
     - name: Restore permissions and ROCm symlinks
       run: |
-        # upload-artifact drops the +x bit and the unversioned .so symlinks the
-        # build created, so rebuild both before running the harness.
+        # upload-artifact's zip wrapper drops the +x bit (but the release tar.gz
+        # already preserved the unversioned .so symlinks), so restore the bits
+        # before running the harness.
         ROOT="${{ runner.temp }}/vllm-qual/vllm"
         # The bundle's Python version is channel-dependent (cp313 stable / cp314
         # nightly); glob it rather than hardcode.
@@ -1204,14 +1231,12 @@ jobs:
         base="${TAG}-x64"
 
         echo "Creating: ${base}.tar.gz"
-        # upload-artifact's zip wrapper drops the +x bit (the qualify job already
-        # restores it before running -- mirror that here or the RELEASED tarball
-        # ships bin/* mode 0644 and consumers get Permission denied). Redundant
-        # once #32's tar-before-upload flow lands; harmless either way.
-        chmod +x ./artifact/bin/* 2>/dev/null || true
-        find ./artifact -path '*/_rocm_sdk_core/lib/llvm/bin/*' -name 'clang*' \
-          -exec chmod +x {} + 2>/dev/null || true
-        tar -czf "${base}.tar.gz" -C ./artifact .
+        # The build job already produced the release archive (with ROCm symlinks
+        # preserved); reuse it instead of re-tarring the artifact, so the release
+        # asset structure stays identical.
+        src=$(find ./artifact -name '*.tar.gz' | head -n1)
+        [ -n "$src" ] || { echo "::error::no release archive in artifact for ${{ matrix.gfx_target }}"; exit 1; }
+        cp "$src" "${base}.tar.gz"
         size_mb=$(du -m "${base}.tar.gz" | cut -f1)
         echo "Archive size: ${size_mb} MB"
 
