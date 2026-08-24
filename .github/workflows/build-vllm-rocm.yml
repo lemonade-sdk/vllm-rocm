@@ -1220,8 +1220,19 @@ jobs:
         # Delete existing release with same tag (idempotent rebuilds)
         gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
 
+        # Channel gating: only stable is promoted to the repo's "latest" release;
+        # nightly and omni are published as prereleases. Lemonade's auto-bump reads
+        # /releases/latest for the stable pin and the newest non-omni prerelease for
+        # the nightly pin, so a nightly/omni tag can never leak into the stable key.
+        release_flags="--latest"
+        if [ "$OMNI" = "true" ] || [ "$CHANNEL" = "nightly" ]; then
+          release_flags="--prerelease"
+        fi
+        echo "Release flags: $release_flags (channel=$CHANNEL omni=$OMNI)"
+
         gh release create "$TAG" \
           --title "$TAG" \
+          $release_flags \
           --notes "**GPU Target**: $TARGET
         **vLLM Version**: $VLLM_VERSION
         **PyTorch Version**: $TORCH_VERSION
