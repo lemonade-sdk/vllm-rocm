@@ -175,6 +175,9 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       ubuntu_matrix: ${{ steps.set-matrix.outputs.ubuntu_matrix }}
+      qualify_matrix: ${{ steps.set-matrix.outputs.qualify_matrix }}
+      qualify_targets: ${{ steps.set-matrix.outputs.qualify_targets }}
+      qualify_count: ${{ steps.set-matrix.outputs.qualify_count }}
     steps:
     - name: Set matrix
       id: set-matrix
@@ -188,6 +191,29 @@ jobs:
           | jq -c)
         echo "ubuntu_matrix=$matrix_targets" >> $GITHUB_OUTPUT
         echo "Generated matrix: $matrix_targets"
+
+        # Targets with qualification hardware, mapped to the self-hosted runner
+        # group that owns each. The qualify job runs one leg per selected target
+        # that appears here; targets absent from this registry build and release
+        # exactly as before (qualify skips them -> release ungated, unchanged).
+        # Adding a runner for a new target (e.g. a CDNA box for gfx942) is a
+        # one-line addition to this map.
+        QUALIFIED_RUNNERS='{"gfx1151":"dev_lab"}'
+        qualify_matrix=$(echo "$targets" \
+          | tr ',' '\n' \
+          | sed 's/^ *//;s/ *$//' \
+          | jq -R . \
+          | jq -s --argjson q "$QUALIFIED_RUNNERS" \
+              'unique | {include: [.[] | select($q[.] != null) | {gfx: ., runner_group: $q[.]}]}' \
+          | jq -c)
+        # JSON array (not a comma list): consumers use fromJson() set membership,
+        # so no target string can substring-match another.
+        qualify_targets=$(echo "$qualify_matrix" | jq -c '[.include[].gfx]')
+        qualify_count=$(echo "$qualify_matrix" | jq -r '.include | length')
+        echo "qualify_matrix=$qualify_matrix" >> $GITHUB_OUTPUT
+        echo "qualify_targets=$qualify_targets" >> $GITHUB_OUTPUT
+        echo "qualify_count=$qualify_count" >> $GITHUB_OUTPUT
+        echo "Qualify matrix: $qualify_matrix"
 
   build-ubuntu:
     # Target the dev_lab runner GROUP explicitly, not just labels. The org's
@@ -774,31 +800,37 @@ jobs:
         # No sudo — it's under the runner's temp dir. Free the box for the next run.
         rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 16-test qualification on the dev_lab Linux gfx1151 box. Targets the dev_lab
-  # runner GROUP (not just labels) so it can't land on a Linux box in another
-  # group the repo can also see (Default is visibility:all) — see build-ubuntu.
+  # 16-test qualification, one leg per selected target that has qualification
+  # hardware (prepare-matrix qualify_matrix: target -> self-hosted runner group;
+  # currently gfx1151 -> dev_lab). Targets the runner GROUP (not just labels) so
+  # a leg can't land on a Linux box in another group the repo can also see
+  # (Default is visibility:all) — see build-ubuntu.
   # Runs the scripts/qualify harness against the built bundle:
   #   tier0 static (6) + tier1 hardware smoke (5) + tier2 functional inference (5)
   # = 16 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
-    needs: build-ubuntu
+    needs: [prepare-matrix, build-ubuntu]
+    strategy:
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.qualify_matrix) }}
+      fail-fast: false
     runs-on:
-      group: dev_lab
+      group: ${{ matrix.runner_group }}
       labels: [self-hosted, Linux]
     env:
-      GFX: gfx1151
+      GFX: ${{ matrix.gfx }}
     # Runs on release builds AND on omni dispatches (omni is experimental —
     # always qualify it, even as a no-publish dry run; release stays gated on
-    # create_release in the create-release job). Skips PRs and dispatches that
-    # didn't select gfx1151 (nothing to test → release ungated).
+    # create_release in the create-release job). Skips PRs and dispatches whose
+    # selected targets have no qualification hardware (nothing to test →
+    # release ungated, matching the previous gfx1151-only behavior).
     if: >-
       github.event_name != 'pull_request' &&
+      needs.prepare-matrix.outputs.qualify_count != '0' &&
       (
         github.event_name == 'schedule' ||
         (
           github.event_name == 'workflow_dispatch' &&
-          contains(github.event.inputs.gfx_target, 'gfx1151') &&
           (
             github.event.inputs.create_release == 'true' ||
             github.event.inputs.create_release == null ||
@@ -810,7 +842,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Download gfx1151 artifact
+    - name: Download ${{ matrix.gfx }} artifact
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
@@ -831,8 +863,8 @@ jobs:
                    -H "Authorization: Bearer $GH_TOKEN" \
                    -H "Accept: application/vnd.github+json" \
                    "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-                 | python3 -c "import sys,json; print(next((a['id'] for a in json.load(sys.stdin)['artifacts'] if a['name']=='vllm-ubuntu-rocm-gfx1151-x64'), ''))")
-        [ -n "$ART_ID" ] || { echo "::error::gfx1151 artifact not found for this run"; exit 1; }
+                 | python3 -c "import sys,json,os; print(next((a['id'] for a in json.load(sys.stdin)['artifacts'] if a['name']==f\"vllm-ubuntu-rocm-{os.environ['GFX']}-x64\"), ''))")
+        [ -n "$ART_ID" ] || { echo "::error::${GFX} artifact not found for this run"; exit 1; }
         echo "Artifact id: $ART_ID"
 
         avail_gb=$(df -BG --output=avail "$WORK" | tail -1 | tr -dc '0-9')
@@ -868,7 +900,7 @@ jobs:
         fi
         rm -f "$ZIP"   # reclaim space immediately
         TARBALL=$(find "$WORK/raw" -name '*.tar.gz' | head -n1)
-        [ -n "$TARBALL" ] || { echo "::error::no release archive in gfx1151 artifact"; exit 1; }
+        [ -n "$TARBALL" ] || { echo "::error::no release archive in ${GFX} artifact"; exit 1; }
         tar -xzf "$TARBALL" -C "$DEST"
         rm -rf "$WORK/raw"
         echo "Extracted $(du -sh "$DEST" | cut -f1) to $DEST"
@@ -876,9 +908,9 @@ jobs:
 
     - name: Restore permissions and ROCm symlinks
       run: |
-        # upload-artifact's zip wrapper drops the +x bit (but the release tar.gz
-        # already preserved the unversioned .so symlinks), so restore the bits
-        # before running the harness.
+        # The artifact zip wraps a single tar.gz whose tar -xzf restores modes
+        # and the unversioned .so symlinks, so this is a defensive backstop
+        # (older raw-file artifacts lost +x), not a required repair.
         ROOT="${{ runner.temp }}/vllm-qual/vllm"
         # The bundle's Python version is channel-dependent (cp313 stable / cp314
         # nightly); glob it rather than hardcode.
@@ -952,7 +984,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: qualification-gfx1151
+        name: qualification-${{ matrix.gfx }}
         path: |
           ${{ runner.temp }}/vllm-qual/fragments/*.json
           ${{ runner.temp }}/vllm-qual/fragments/*.log
@@ -985,10 +1017,13 @@ jobs:
       with:
         path: repo
 
-    - name: Download qualification report
+    - name: Download qualification reports
       uses: actions/download-artifact@v4
       with:
-        name: qualification-gfx1151
+        # One artifact per qualified target; each lands in report/qualification-<gfx>/
+        # (merge-multiple stays off on purpose: every leg names its report
+        # qualification-report.json, so merging would clobber).
+        pattern: qualification-*
         path: report
 
     - name: Enrich summary prose (optional, best-effort)
@@ -996,22 +1031,28 @@ jobs:
       # in the report; this rewrites only its prose and never fails the job.
       if: env.ANTHROPIC_API_KEY != ''
       run: |
-        if [ ! -f report/qualification-report.json ]; then
-          echo "no report to enrich"; exit 0
-        fi
-        python3 -m pip install --quiet --disable-pip-version-check anthropic \
-          || { echo "::warning::pip install anthropic failed; skipping enrichment"; exit 0; }
-        python3 repo/scripts/qualify/enrich_summary.py \
-          --report report/qualification-report.json \
-          --model claude-haiku-4-5 || true
+        found=0
+        for rpt in report/qualification-*/qualification-report.json; do
+          [ -f "$rpt" ] || continue
+          if [ "$found" = 0 ]; then
+            python3 -m pip install --quiet --disable-pip-version-check anthropic \
+              || { echo "::warning::pip install anthropic failed; skipping enrichment"; exit 0; }
+          fi
+          found=1
+          python3 repo/scripts/qualify/enrich_summary.py \
+            --report "$rpt" \
+            --model claude-haiku-4-5 || true
+        done
+        [ "$found" = 1 ] || echo "no report to enrich"
 
     - name: Publish to qualification-data branch
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-        if [ ! -f report/qualification-report.json ]; then
-          echo "::warning::no qualification-report.json in artifact; nothing to publish"
+        reports=$(ls report/qualification-*/qualification-report.json 2>/dev/null || true)
+        if [ -z "$reports" ]; then
+          echo "::warning::no qualification-report.json in any artifact; nothing to publish"
           exit 0
         fi
         git config --global user.name "github-actions[bot]"
@@ -1035,10 +1076,12 @@ jobs:
             git -C data rm -rf . >/dev/null 2>&1 || true
           fi
 
-          python3 repo/scripts/publish_qualification.py \
-            --report report/qualification-report.json \
-            --data-dir data/qualification \
-            --run-url "$RUN_URL"
+          for rpt in $reports; do
+            python3 repo/scripts/publish_qualification.py \
+              --report "$rpt" \
+              --data-dir data/qualification \
+              --run-url "$RUN_URL"
+          done
           # Keep the contract doc alongside the data on the branch.
           cp repo/docs/qualification-feed.md data/qualification/SCHEMA.md
 
@@ -1046,7 +1089,7 @@ jobs:
           if git -C data diff --cached --quiet; then
             echo "no changes to publish"; pushed=1; break
           fi
-          git -C data commit -q -m "qualification: run ${{ github.run_id }} (gfx1151)"
+          git -C data commit -q -m "qualification: run ${{ github.run_id }}"
           if git -C data push origin "$BRANCH" 2>/dev/null; then
             pushed=1; break
           fi
@@ -1187,17 +1230,18 @@ jobs:
         Portable vLLM build for $TARGET. Includes bundled Python, PyTorch ROCm, and ROCm runtime. No separate installation required." \
           $upload_files
 
-    - name: Attach qualification report to release (gfx1151)
-      # Co-locate the qualification proof with the shippable artifact. gfx1151 is
-      # the hardware-qualified target; best-effort so it never fails the release.
-      if: matrix.gfx_target == 'gfx1151'
+    - name: Attach qualification report to release
+      # Co-locate the qualification proof with the shippable artifact, for any
+      # target that was hardware-qualified this run; best-effort so it never
+      # fails the release.
+      if: contains(fromJson(needs.prepare-matrix.outputs.qualify_targets), matrix.gfx_target)
       continue-on-error: true
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
         rm -rf qual && mkdir -p qual
-        if ! gh run download "${{ github.run_id }}" -n qualification-gfx1151 -D qual --repo "${{ github.repository }}"; then
+        if ! gh run download "${{ github.run_id }}" -n "qualification-${{ matrix.gfx_target }}" -D qual --repo "${{ github.repository }}"; then
           echo "::warning::qualification artifact not found; skipping attach"; exit 0
         fi
         if [ -f qual/qualification-report.json ]; then
