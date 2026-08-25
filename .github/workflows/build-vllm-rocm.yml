@@ -723,6 +723,108 @@ jobs:
       run: |
         bash scripts/build_omni_layer.sh
 
+    - name: Make console-script shebangs relocatable
+      # pip records the build-time interpreter path in every console script it
+      # generates, so on a consumer machine execve() fails and reports the
+      # SCRIPT as missing rather than the interpreter. Rewrite the shebang to
+      # resolve the interpreter next to the script. The replacement is valid sh
+      # and a no-op string expression in Python, so the scripts still parse.
+      # Matches ANY absolute python-interpreter shebang (not just $VLLM_ROOT/bin:
+      # wheels can record foreign build prefixes like /opt/vllm), including
+      # distlib's quoted form (#!"/path with spaces/python3") and interpreter
+      # options (#!/path/python3 -u), which are re-emitted after the resolved
+      # interpreter. A PEP 263 coding cookie on line 2 is carried forward so it
+      # stays within the two lines Python scans. __doc__ is reset to None so the
+      # trampoline text never leaks into argparse(description=__doc__).
+      # Completeness gate: after the pass, re-scan and FAIL if any absolute
+      # python shebang remains ("no build-time shebangs remain", not "at least
+      # one was fixed"), then compile() every rewritten file as a parse check.
+      run: |
+        : "${VLLM_ROOT:?VLLM_ROOT is unset -- refusing to guess the bundle path}"
+        python3 - "$VLLM_ROOT/bin" <<'PYEOF'
+        import os, re, stat, sys
+        from pathlib import Path
+
+        bindir = Path(sys.argv[1])
+        name_re = re.compile(rb"^python[0-9]*(\.[0-9]+)*$")  # not python3-config
+        coding_re = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*[-_.a-zA-Z0-9]+")
+
+        def parse_shebang(first):
+            """(interpreter, [options]) for an absolute-path shebang, else (None, None)."""
+            body = first[2:].rstrip(b"\r").strip()
+            if body.startswith(b'"'):
+                end = body.find(b'"', 1)
+                if end < 0:
+                    return None, None
+                return body[1:end], body[end + 1:].split()
+            fields = body.split()
+            if not fields or not fields[0].startswith(b"/"):
+                return None, None
+            return fields[0], fields[1:]
+
+        def python_shebang(first):
+            interp, opts = parse_shebang(first)
+            if interp is None or not name_re.match(os.path.basename(interp)):
+                return None, None
+            return interp, opts
+
+        fixed = []
+        for path in sorted(bindir.iterdir()):
+            if not path.is_file() or path.is_symlink():
+                continue
+            first, _, rest = path.read_bytes().partition(b"\n")
+            if not first.startswith(b"#!"):
+                continue
+            interp, opts = python_shebang(first)
+            if interp is None:
+                continue
+            name = os.path.basename(interp)
+            cookie = b""
+            rest_first, _, rest_tail = rest.partition(b"\n")
+            if coding_re.match(rest_first):
+                cookie = rest_first + b"\n"
+                rest = rest_tail
+            optstr = b" " + b" ".join(opts) if opts else b""
+            # A statement before `from __future__` is a SyntaxError (the polyglot
+            # DOCSTRING before it is legal) -- caught by the compile() gate on the
+            # real bundle (numba). Those few scripts keep the trampoline as
+            # __doc__; everything else gets None.
+            doc_reset = b"" if b"from __future__" in rest else b"__doc__ = None\n"
+            mode = path.stat().st_mode
+            path.write_bytes(
+                b"#!/bin/sh\n" + cookie
+                + b"'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/" + name + b"\""
+                + optstr + b" \"$0\" \"$@\"\n"
+                b"' '''\n"
+                + doc_reset + rest
+            )
+            os.chmod(path, stat.S_IMODE(mode))
+            fixed.append(path)
+
+        print("rewrote %d console-script shebangs" % len(fixed))
+        if not fixed:
+            sys.exit("error: rewrote nothing -- refusing to ship an unchecked bundle")
+
+        leftover = []
+        for path in sorted(bindir.iterdir()):
+            if not path.is_file() or path.is_symlink():
+                continue
+            first = path.read_bytes().partition(b"\n")[0]
+            if first.startswith(b"#!") and python_shebang(first)[0] is not None:
+                leftover.append(path.name)
+        if leftover:
+            sys.exit("error: build-time python shebangs remain after the pass: %s"
+                     % ", ".join(leftover))
+
+        for path in fixed:
+            try:
+                compile(path.read_bytes(), str(path), "exec")
+            except SyntaxError as e:
+                sys.exit("error: rewritten script no longer parses: %s: %s" % (path, e))
+        print("verified: 0 absolute python shebangs remain; %d rewritten scripts compile"
+              % len(fixed))
+        PYEOF
+
     - name: Verify bundled environment works
       run: |
         SP="$VLLM_ROOT/lib/python${PYVER}/site-packages"
@@ -744,6 +846,30 @@ jobs:
         print('Native extensions verified')
         "
         bash -n $VLLM_ROOT/bin/vllm-server
+        # Execute one REWRITTEN console script for real -- python3 -c above runs
+        # the interpreter directly and bash -n checks the untouched wrapper, so
+        # neither would notice all ~113 rewritten scripts being dead. This
+        # exercises the sh trampoline end-to-end (a full sh -n cannot: sh parses
+        # a polyglot past the exec line into the Python body).
+        #
+        # Pick the probe at runtime rather than hardcoding a name: the Strip step
+        # removes $SP/pip* (and build_omni_layer.sh re-strips it), so bin/pip is a
+        # DANGLING console script -- probing it fails with ModuleNotFoundError on
+        # every build, which says nothing about the trampoline. Candidates below
+        # are ordered by how certain their module is to survive the strip; torch
+        # and vllm are the bundle's reason to exist and are never trimmed.
+        probe=""
+        for cand in torchrun vllm isympy f2py normalizer; do
+          [ -x "$VLLM_ROOT/bin/$cand" ] || continue
+          # Confirm the module behind it survived the strip before relying on it.
+          if "$VLLM_ROOT/bin/$cand" --help >/dev/null 2>&1; then probe="$cand"; break; fi
+        done
+        if [ -z "$probe" ]; then
+          echo "::error::no rewritten console script could be executed -- the sh trampoline may be broken"
+          ls -1 "$VLLM_ROOT/bin" | head -40
+          exit 1
+        fi
+        echo "trampoline probe OK: bin/$probe launched the bundled interpreter"
         echo "All sanity checks passed"
 
     - name: Report final size
