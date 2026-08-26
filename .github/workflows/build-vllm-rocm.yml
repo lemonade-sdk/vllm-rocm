@@ -56,6 +56,13 @@ env:
   # have different triggers and different upstream sources, so they run as
   # separate workflow runs. Scheduled runs default to nightly.
   CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
+  # build-ubuntu runs on the PERSISTENT dev_lab self-hosted box (not a fresh VM),
+  # so pip's default on-disk wheel cache (~/.cache/pip) is never reclaimed and
+  # grows unbounded across the daily nightly runs until an install dies with
+  # ENOSPC ([Errno 28] No space left on device) mid-download. The cross-run
+  # cache buys us nothing here (each wheel is installed once per run), so disable
+  # it globally: pip streams wheels straight to the install and keeps no copy.
+  PIP_NO_CACHE_DIR: "1"
   # When true, layer vLLM-Omni on top of the base bundle (built on the same
   # channel) and release it as a separate vllm-omni* artifact. vLLM-Omni is a
   # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
@@ -263,6 +270,28 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Reclaim disk space (self-hosted hygiene)
+      run: |
+        # This job runs on the PERSISTENT dev_lab box shared with qualify, not a
+        # fresh GitHub-hosted VM — leftovers survive between runs and eventually
+        # exhaust the disk (the stable install died with ENOSPC while writing the
+        # 602 MB rocm-sdk-libraries wheel). Reclaim before every build:
+        #   - the legacy persistent pip cache (we now install with
+        #     PIP_NO_CACHE_DIR=1, so ~/.cache/pip only ever shrinks from here)
+        #   - stale build trees from prior/crashed runs (a run that dies on ENOSPC
+        #     never reaches this job's end-of-job cleanup)
+        echo "=== Disk BEFORE cleanup ==="; df -h "$RUNNER_TEMP" || true
+        # ---- TEMPORARY debug: what is eating the disk? Remove once diagnosed. ----
+        echo "--- top consumers in HOME cache + RUNNER_TEMP ---"
+        du -sh "$HOME/.cache/pip"          2>/dev/null || true
+        du -sh "$HOME/.cache/huggingface"  2>/dev/null || true
+        du -sh "$RUNNER_TEMP"/vllm-build*  2>/dev/null || true
+        du -sh "$RUNNER_TEMP"/* 2>/dev/null | sort -rh | head -20 || true
+        # -------------------------------------------------------------------------
+        rm -rf "$HOME/.cache/pip"         2>/dev/null || true
+        rm -rf "$RUNNER_TEMP"/vllm-build* 2>/dev/null || true
+        echo "=== Disk AFTER cleanup ==="; df -h "$RUNNER_TEMP" || true
 
     - name: Download portable Python (python-build-standalone)
       run: |
