@@ -8,7 +8,7 @@ ledger (`results/ledger.jsonl`).
 
 | Tier | Where it runs | Catches | Gating |
 |------|---------------|---------|--------|
-| 0 static | hosted build runner (no GPU) | torch ABI / version-pin mismatch, missing native exts, broken launcher | yes |
+| 0 static | hosted build runner (no GPU) | torch ABI / version-pin mismatch, missing native exts, broken launcher, stranded clang (Triton JIT) | yes |
 | 1 smoke | gfx1151 self-hosted | native ext won't dlopen, platform import crash, GPU not visible | yes |
 | 2 inference | gfx1151 self-hosted | server won't boot, broken Triton JIT, dead endpoints | yes |
 | 3 lemonade | gfx1151 self-hosted (reusable workflow in lemonade) | install path, recipe registry, real-model load+chat | yes |
@@ -37,22 +37,36 @@ suffix (`…-stable` / `…-nightly`), **not** GitHub's single "latest" pointer
 
 ## What each tier looks for
 
+### Tier 0
 - **T0.1** vLLM's `Requires-Dist: torch==` release == the bundled torch release.
-- **T0.2** every undefined `c10::`/`at::`/`torch::` symbol in `_C.abi3.so` /
-  `_rocm_C.abi3.so` is defined by a bundled torch/ROCm lib.
-- **T0.3** DT_NEEDED sonames resolve in-bundle (warn). **T0.4** required files +
-  launcher syntax. **T0.6** bundled amdsmi present.
+- **T0.2** every undefined `c10::`/`at::`/`torch::` symbol in `_C.abi3.so` / `_rocm_C.abi3.so` is defined by a bundled torch/ROCm lib.
+- **T0.3** DT_NEEDED sonames resolve in-bundle (warn). 
+- **T0.4** required files + launcher syntax. 
+- **T0.6** bundled amdsmi present. 
+- **T0.7** the bundled clang the launcher exports as `CC` resolves its `clang-NN` exec target and compiles a
+  `-shared -fPIC` stub — the exact Triton launcher-compile path, checked
+  statically so a stranded compiler can't ship green.
+
+### Tier 1
 - **T1.1** `import vllm._C, vllm._rocm_C`. **T1.2** `from vllm.platforms import
-  current_platform`. **T1.3** torch.cuda sees the GPU + gcnArchName. **T1.4**
-  amdsmi ASIC read (warn). **T1.5** `vllm-server --help`.
-- **T2.1** server boots. **T2.2** non-empty completion. **T2.3** greedy
-  determinism. **T2.4** chat. **T2.5** streaming.
+  current_platform`. 
+- **T1.3** torch.cuda sees the GPU + gcnArchName. 
+- **T1.4** amdsmi ASIC read (warn). 
+- **T1.5** `vllm-server --help`.
+
+### Tier 2
+- **T2.1** server boots. **T2.2** non-empty completion. 
+- **T2.3** greedy determinism. 
+- **T2.4** chat. 
+- **T2.5** streaming.
 - **Omni variant** (`tier2_omni.py`, run *instead of* `tier2_inference.py` on
   builds made with the workflow's `omni: true` input): boots `vllm-omni-server`
   on `Qwen2.5-Omni-3B` with a single-GPU deploy config
   (`deploy/qwen2_5_omni_1gpu.yaml`) and checks **T2.1** omni server boot,
   **T2.2** chat completion, **T2.3** streaming. Emits the same `tier2` fragment,
   so promotion (`--require-tiers tier0,tier1,tier2`) is unchanged.
+
+### Tier 3
 - **T3.n** lemonade installs the candidate and each hot vLLM model loads + chats;
   tokens/sec and TTFT captured as metrics.
 

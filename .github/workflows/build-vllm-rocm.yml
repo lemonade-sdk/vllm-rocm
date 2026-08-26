@@ -56,6 +56,13 @@ env:
   # have different triggers and different upstream sources, so they run as
   # separate workflow runs. Scheduled runs default to nightly.
   CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
+  # build-ubuntu runs on the PERSISTENT dev_lab self-hosted box (not a fresh VM),
+  # so pip's default on-disk wheel cache (~/.cache/pip) is never reclaimed and
+  # grows unbounded across the daily nightly runs until an install dies with
+  # ENOSPC ([Errno 28] No space left on device) mid-download. The cross-run
+  # cache buys us nothing here (each wheel is installed once per run), so disable
+  # it globally: pip streams wheels straight to the install and keeps no copy.
+  PIP_NO_CACHE_DIR: "1"
   # When true, layer vLLM-Omni on top of the base bundle (built on the same
   # channel) and release it as a separate vllm-omni* artifact. vLLM-Omni is a
   # pure-Python layer; the omni bundle is the base bundle + vllm-omni + its deps
@@ -263,6 +270,25 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Reclaim disk space (self-hosted hygiene)
+      run: |
+        # This job runs on the PERSISTENT dev_lab box, where ~/.cache and /tmp live
+        # on a SMALL ~32G root overlay ("/") — the 1.7T nvme is only the runner work
+        # dir ($RUNNER_TEMP), NOT where pip caches.
+        # pip's default wheel cache grew on that 32G root across the daily nightly runs 
+        # until it hit ~93% full and an install died with ENOSPC ([Errno 28]) mid-download.
+        # We now install with PIP_NO_CACHE_DIR=1 (no new cache is ever written) and reclaim
+        # before every build so the root overlay stays healthy:
+        #   - the legacy pip cache on root (only ever shrinks from here)
+        #   - stale build trees from prior/crashed runs (a run that dies on ENOSPC never reaches this job's end-of-job cleanup)
+        # NB: ~/.cache/huggingface (qualify's model weights) also lives on root —
+        # we deliberately leave it (deleting forces slow re-downloads);
+        # watch it if root pressure returns.
+        echo "=== Disk BEFORE cleanup ==="; df -h / "$RUNNER_TEMP" || true
+        rm -rf "$HOME/.cache/pip"         2>/dev/null || true
+        rm -rf "$RUNNER_TEMP"/vllm-build* 2>/dev/null || true
+        echo "=== Disk AFTER cleanup ===";  df -h / "$RUNNER_TEMP" || true
 
     - name: Download portable Python (python-build-standalone)
       run: |
@@ -677,18 +703,55 @@ jobs:
 
         # Trim LLVM toolchain: keep only clang + its libs (~350MB saved)
         LLVM="$SP/_rocm_sdk_core/lib/llvm"
-        # Keep the clang driver and its versioned binary (clang-NN). The LLVM
-        # major tracks the ROCm release (clang-22 on 7.13, clang-23 on 7.14);
-        # hardcoding clang-22 would delete the real compiler on newer ROCm and
-        # break Triton's runtime JIT. Match clang-* so it survives any version.
+        # Keep the clang driver AND its versioned exec target (clang-NN).
+        
+        # When invoked as the unversioned `clang`, the driver resolves /proc/self/exe
+        # and re-execs `clang-<major>` to do the actual compile, so deleting the
+        # versioned binary strands the driver and breaks Triton's runtime JIT.
+        
+        # The LLVM major tracks the ROCm release and is NOT knowable ahead of
+        # time, so match clang-* rather than a hardcoded version. 
+        
+        # clang-NN can be shipped as a real file OR a symlink depending on the wheel,
+        # so BOTH passes must spare clang-* — the symlink pass previously kept only `clang` and so
+        # deleted a clang-NN *symlink*, stranding the driver (issues #16/#19/#40).
+        
         find "$LLVM/bin" -type f ! -name "clang" ! -name "clang-*" -delete 2>/dev/null || true
-        find "$LLVM/bin" -type l ! -name "clang" -delete 2>/dev/null || true
+        find "$LLVM/bin" -type l ! -name "clang" ! -name "clang-*" -delete 2>/dev/null || true
         # Keep only libs that clang needs (libclang-cpp, libLLVM, rocm_sysdeps)
         find "$LLVM/lib" -name "*.so*" \
           ! -name "libclang-cpp*" \
           ! -name "libLLVM*" \
           -delete 2>/dev/null || true
         rm -rf "$LLVM/lib/clang/"*/include/cuda_wrappers 2>/dev/null || true
+
+        # Fail the build if the trim stranded the compiler.
+        # The launcher exports CC=this clang, so Triton compiles its
+        # per-kernel __triton_launcher.c with exactly this driver at model load;
+        # reproduce that compile here, on the build box, with no GPU needed.
+        if [ -e "$LLVM/bin/clang" ]; then
+          chmod +x "$LLVM/bin/"clang* 2>/dev/null || true
+          # LLVM major = the resource dir the wheel ships (authoritative even if the driver itself can't run yet): lib/clang/<major>/.
+          MAJOR=$(basename "$(ls -d "$LLVM/lib/clang"/*/ 2>/dev/null | head -1)" 2>/dev/null || true)
+          if [ -n "$MAJOR" ] && [ ! -e "$LLVM/bin/clang-$MAJOR" ]; then
+            echo "::error::LLVM trim stranded clang-$MAJOR (the clang driver re-execs it for Triton JIT)"
+            ls -la "$LLVM/bin" || true
+            exit 1
+          fi
+          # End-to-end: the driver must resolve its clang-NN and produce a shared object from a trivial C source — exactly Triton's launcher compile.
+          echo 'int main(void){return 0;}' > /tmp/cc_probe.c
+          if ! LD_LIBRARY_PATH="$LLVM/lib:$SP/_rocm_sdk_core/lib:${LD_LIBRARY_PATH:-}" \
+               "$LLVM/bin/clang" -shared -fPIC -O3 -o /tmp/cc_probe.so /tmp/cc_probe.c 2>/tmp/cc_probe.err; then
+            echo "::error::bundled clang cannot compile after trim — Triton JIT would fail at model load"
+            cat /tmp/cc_probe.err || true
+            ls -la "$LLVM/bin" || true
+            exit 1
+          fi
+          echo "bundled clang OK: driver + clang-$MAJOR present, stub -shared -fPIC compile succeeded"
+          rm -f /tmp/cc_probe.c /tmp/cc_probe.so /tmp/cc_probe.err
+        else
+          echo "::warning::no bundled clang under $LLVM/bin — Triton JIT will need a system compiler"
+        fi
 
         # Trim ROCm SDK bin/ (Python wrapper scripts, not needed)
         rm -rf "$SP/_rocm_sdk_core/bin" 2>/dev/null || true
@@ -926,14 +989,14 @@ jobs:
         # No sudo — it's under the runner's temp dir. Free the box for the next run.
         rm -rf "$RUNNER_TEMP/vllm-build" || true
 
-  # 16-test qualification, one leg per selected target that has qualification
+  # 17-test qualification, one leg per selected target that has qualification
   # hardware (prepare-matrix qualify_matrix: target -> self-hosted runner group;
   # currently gfx1151 -> dev_lab). Targets the runner GROUP (not just labels) so
   # a leg can't land on a Linux box in another group the repo can also see
   # (Default is visibility:all) — see build-ubuntu.
   # Runs the scripts/qualify harness against the built bundle:
-  #   tier0 static (6) + tier1 hardware smoke (5) + tier2 functional inference (5)
-  # = 16 tests, then aggregates them into a qualification report and a promotion
+  #   tier0 static (7) + tier1 hardware smoke (5) + tier2 functional inference (5)
+  # = 17 tests, then aggregates them into a qualification report and a promotion
   # decision. Releases are gated on promotion (see create-release `needs`).
   qualify:
     needs: [prepare-matrix, build-ubuntu]
@@ -1053,7 +1116,7 @@ jobs:
           if [ ! -e "$link" ]; then ln -sf "$name" "$link"; fi
         done
 
-    - name: Run 16-test qualification (tier0 + tier1 + tier2)
+    - name: Run 17-test qualification (tier0 + tier1 + tier2)
       id: qual
       run: |
         WORK="${{ runner.temp }}/vllm-qual"
@@ -1070,7 +1133,7 @@ jobs:
         # The tiers are run WITHOUT --fail-on-error so all 16 tests execute and
         # emit a JSON fragment even when one fails; `aggregate --fail-on-no-promote`
         # is the single gate that decides pass/fail for the whole job.
-        echo "::group::Tier 0 — static bundle verification (T0.1–T0.6)"
+        echo "::group::Tier 0 — static bundle verification (T0.1–T0.7)"
         "$PY" "$Q/tier0_static.py"   --bundle-root "$ROOT" --gfx-target "$GFX" \
             --channel "$CHANNEL" --candidate-tag "$TAG" --output "$FRAG/tier0-report.json" || true
         echo "::endgroup::"
