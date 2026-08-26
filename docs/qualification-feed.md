@@ -69,12 +69,12 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
       "vllm_version": "0.22.1+rocm722",
       "torch_version": "2.11.0+rocm7.13.0",
       "rocm_version": "7.13.0",
-      "tests": { "passed": 8, "failed": 8, "warned": 0, "skipped": 0, "total": 16 },
+      "tests": { "passed": 9, "failed": 8, "warned": 0, "skipped": 0, "total": 17 },
       "qualified": false,                      // == promoted; "did it qualify to release"
       "overall": "fail",                       // pass | fail | warn
       "blocked_by": ["tier0=fail", "tier1=fail", "tier2 missing"],
-      "results": {                             // per-test status across the 16-test suite
-        "T0.1": "fail", "T0.2": "fail", "T0.3": "pass", "T0.4": "pass", "T0.5": "pass", "T0.6": "pass",
+      "results": {                             // per-test status across the 17-test suite
+        "T0.1": "fail", "T0.2": "fail", "T0.3": "pass", "T0.4": "pass", "T0.5": "pass", "T0.6": "pass", "T0.7": "pass",
         "T1.1": "fail", "T1.2": "pass", "T1.3": "pass", "T1.4": "pass", "T1.5": "pass",
         "T2.1": "missing", "T2.2": "missing", "T2.3": "missing", "T2.4": "missing", "T2.5": "missing"
       },
@@ -92,12 +92,12 @@ field so re-runs are visible, but they don't fork the record — the dashboard a
 
 ### Field notes
 
-- **`tests.total` is always 16** (the canonical suite). A tier that produced no
+- **`tests.total` is always 17** (the canonical suite). A tier that produced no
   fragment (e.g. Tier 2 when the server failed to boot) has its tests marked
   `"missing"` in `results` and **counted as `failed`**. So `passed + failed +
-  warned + skipped == 16` always, and the counts never look misleadingly small.
+  warned + skipped == 17` always, and the counts never look misleadingly small.
 - **`results`** values are one of `pass | fail | warn | skip | missing`. Test ids are
-  the canonical 16: T0.1–T0.6, T1.1–T1.5, T2.1–T2.5. This lets the dashboard
+  the canonical 17: T0.1–T0.7, T1.1–T1.5, T2.1–T2.5. This lets the dashboard
   compute failure-frequency and heatmap views from `index.json` alone (no N+1 fetch).
 - **`qualified`** is the release gate (`true` only if every required tier passed).
 - **`report_url`** is relative to the feed base — open it for the full per-test

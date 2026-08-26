@@ -26,6 +26,11 @@ Checks:
         hipErrorInvalidImage. This static check catches that drop before the
         hardware tiers (and before release).
   T0.6  amdsmi path sanity             — bundled amdsmi package is present.
+  T0.7  clang toolchain can compile    — the bundled clang the launcher exports
+        as CC exists, resolves its versioned clang-NN exec target, reports a
+        version, and compiles a trivial `-shared -fPIC` stub. This reproduces
+        Triton's per-kernel __triton_launcher.c build statically and with no GPU, 
+        so a hollow compiler can't ship green.
 
 Usage:
     python tier0_static.py --bundle-root /opt/vllm \
@@ -402,6 +407,110 @@ def check_amdsmi_path(sp):
     return (report.STATUS_PASS, None, details)
 
 
+def _llvm_dir(sp):
+    return os.path.join(sp, "_rocm_sdk_core", "lib", "llvm")
+
+
+def _clang_ld_library_path(sp):
+    """The lib dirs the launcher puts on LD_LIBRARY_PATH so clang can run."""
+    parts = [
+        os.path.join(_llvm_dir(sp), "lib"),
+        os.path.join(sp, "_rocm_sdk_core", "lib"),
+    ]
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    if existing:
+        parts.append(existing)
+    return ":".join(p for p in parts if p)
+
+
+def _clang_major(llvm):
+    """LLVM major from the authoritative resource dir lib/clang/<major>/.
+
+    Read from the shipped resource dir (not `clang --version`) so it is known
+    even when the driver itself can't run yet — which is exactly the failure
+    this check exists to detect.
+    """
+    for path in sorted(glob.glob(os.path.join(llvm, "lib", "clang", "*"))):
+        name = os.path.basename(path.rstrip(os.sep))
+        if name.isdigit():
+            return name
+    return None
+
+
+def check_clang_toolchain(sp):
+    """T0.7 — the bundled clang the launcher exports as CC must actually compile.
+
+    The launcher (build-vllm-rocm.yml) sets `CC=$SP/_rocm_sdk_core/lib/llvm/bin/
+    clang`, and Triton shells out to `$CC` to build each kernel's
+    __triton_launcher.c at model load. When the LLVM-trim step strands the
+    versioned `clang-NN` the driver re-execs, that compile dies with
+    "could not exec .../clang-NN: No such file or directory" — a bundle that
+    still passes every other gate (the older tiers never invoke the compiler).
+    Reproduce the exact compile here, statically and with no GPU.
+    """
+    llvm = _llvm_dir(sp)
+    clang = os.path.join(llvm, "bin", "clang")
+    details: dict = {"clang": clang}
+
+    if not os.path.isdir(llvm):
+        # No bundled LLVM toolchain at all — nothing we packaged to verify.
+        return (report.STATUS_SKIP, "no bundled LLVM toolchain under _rocm_sdk_core", details)
+    if not os.path.exists(clang):
+        # The launcher hardcodes CC to this path, so its absence is fatal.
+        return (report.STATUS_FAIL, "bundled clang driver missing (launcher exports it as CC)", details)
+
+    major = _clang_major(llvm)
+    details["llvm_major"] = major
+    versioned = os.path.join(llvm, "bin", f"clang-{major}") if major else None
+    details["clang_versioned"] = versioned
+    if versioned and not os.path.exists(versioned):
+        return (
+            report.STATUS_FAIL,
+            f"clang driver present but its exec target clang-{major} is missing "
+            "(stranded by the LLVM trim — Triton JIT will fail at model load)",
+            details,
+        )
+
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = _clang_ld_library_path(sp)
+
+    ver = subprocess.run(
+        [clang, "--version"], capture_output=True, text=True, env=env, check=False
+    )
+    details["version_rc"] = ver.returncode
+    if ver.returncode != 0:
+        details["version_stderr"] = (ver.stderr or "").strip()[-400:]
+        return (report.STATUS_FAIL, f"`clang --version` exited {ver.returncode}", details)
+    details["version"] = (ver.stdout or "").strip().splitlines()[:1]
+
+    # The real test: compile a trivial C source to a shared object exactly the
+    # way Triton's runtime build.py drives CC for __triton_launcher.c.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "cc_probe.c")
+        out = os.path.join(tmp, "cc_probe.so")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write("int probe(void){return 0;}\n")
+        comp = subprocess.run(
+            [clang, "-shared", "-fPIC", "-O3", "-o", out, src],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        details["compile_rc"] = comp.returncode
+        produced = os.path.exists(out) and os.path.getsize(out) > 0
+        details["compiled_so"] = produced
+        if comp.returncode != 0 or not produced:
+            details["compile_stderr"] = (comp.stderr or "").strip()[-400:]
+            return (
+                report.STATUS_FAIL,
+                "bundled clang could not compile a `-shared -fPIC` stub "
+                "(the Triton launcher-compile path) — bundle is unusable for JIT",
+                details,
+            )
+
+    return (report.STATUS_PASS, None, details)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tier 0 static bundle verification")
     parser.add_argument(
@@ -467,6 +576,11 @@ def main():
     )
     tier.run(
         "T0.6", "amdsmi path sanity", lambda: check_amdsmi_path(sp), gating=False
+    )
+    tier.run(
+        "T0.7",
+        "clang toolchain can compile",
+        lambda: check_clang_toolchain(sp),
     )
 
     tier.write(args.output)
