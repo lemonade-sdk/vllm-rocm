@@ -1,0 +1,11 @@
+# actionlint only knows GitHub's hosted labels, so every self-hosted label in
+# this repo reads as a typo without this file. Declaring them here makes a
+# genuine typo ("strix-hallo") an error again, which is the point.
+self-hosted-runner:
+  labels:
+    # AMD DevLab ephemeral pool: per-job Strix Halo VMs from the orchestrator.
+    # Reached by these specific labels -- the runners are registered to the
+    # repo, so they sit in the repo's Default group and `group:` cannot select
+    # them. The pool also refuses jobs that name only generic labels.
+    - strix-halo
+    - ephemeral

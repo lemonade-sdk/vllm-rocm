@@ -1,0 +1,219 @@
+# The 16-test qualification harness, as a composite action so that every pool
+# runs the same tests. Extracted from build-vllm-rocm.yml's qualify job; see
+# the build action for why there is one body rather than one per pool.
+#
+# tier0 static (6) + tier1 hardware smoke (5) + tier2 functional inference (5),
+# aggregated into a qualification report and a promotion decision.
+name: Qualify vLLM ROCm bundle
+description: >-
+  Download a built bundle, run the 16-test qualification harness against real
+  hardware, and upload the report.
+
+inputs:
+  gfx:
+    description: GPU target being qualified.
+    required: true
+  build_artifact:
+    description: Name of the bundle artifact to qualify.
+    required: true
+  report_artifact_name:
+    description: >-
+      Name to upload the qualification report under. publish-qualification
+      globs `qualification-*`, so a caller whose results must stay out of the
+      published feed has to pick a name outside that glob.
+    required: true
+  channel:
+    description: nightly or stable.
+    required: true
+  omni:
+    description: When 'true', run the omni tier as well.
+    required: false
+    default: 'false'
+  vllm_version:
+    description: vLLM version from the build, used to tag the report.
+    required: false
+    default: ''
+  omni_version:
+    description: vLLM-Omni version from the build, empty on non-omni runs.
+    required: false
+    default: ''
+
+outputs:
+  result:
+    description: Promotion decision emitted by the harness.
+    value: ${{ steps.qual.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    # See the build action: the step bodies read these as shell variables, and
+    # the action's contract should be its inputs rather than its caller's env.
+    - name: Export qualification parameters
+      shell: bash
+      run: |
+        {
+          echo "GFX=${{ inputs.gfx }}"
+          echo "CHANNEL=${{ inputs.channel }}"
+          echo "OMNI=${{ inputs.omni }}"
+          echo "BUILD_ARTIFACT=${{ inputs.build_artifact }}"
+        } >> "$GITHUB_ENV"
+
+    - name: Download ${{ inputs.gfx }} artifact
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        WORK="${{ runner.temp }}/vllm-qual"
+        DEST="$WORK/vllm"
+        ZIP="$WORK/artifact.zip"
+        mkdir -p "$DEST"
+        echo "=== Disk before download ==="; df -h "$WORK" || true
+
+        # The build artifact is ~3.3 GB (extracts to ~11 GB). actions/download-artifact@v4
+        # is unreliable for artifacts this size on self-hosted runners, so pull the
+        # artifact zip directly with curl (streams to disk, resumable), unzip it to
+        # recover the release tar.gz, then untar it below.
+        # Resolve the artifact id via the REST API with curl + python3 — the box
+        # does not have the gh CLI installed.
+        ART_ID=$(curl -fsSL \
+                   -H "Authorization: Bearer $GH_TOKEN" \
+                   -H "Accept: application/vnd.github+json" \
+                   "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                 | python3 -c "import sys,json,os; print(next((a['id'] for a in json.load(sys.stdin)['artifacts'] if a['name']==os.environ['BUILD_ARTIFACT']), ''))")
+        [ -n "$ART_ID" ] || { echo "::error::${GFX} artifact not found for this run"; exit 1; }
+        echo "Artifact id: $ART_ID"
+
+        avail_gb=$(df -BG --output=avail "$WORK" | tail -1 | tr -dc '0-9')
+        echo "Available space: ${avail_gb} GB"
+        if [ "${avail_gb:-0}" -lt 15 ]; then
+          echo "::error::Only ${avail_gb} GB free on the runner; need ~15 GB for the 11 GB build."
+          exit 1
+        fi
+
+        ok=0
+        for attempt in 1 2 3; do
+          echo "=== curl attempt $attempt ==="
+          if curl -fL --retry 5 --retry-delay 10 --retry-all-errors -C - \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  -o "$ZIP" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip"; then
+            ok=1; break
+          fi
+          echo "attempt $attempt failed; retrying in 15s"; sleep 15
+        done
+        [ "$ok" = "1" ] || { echo "::error::artifact zip download failed after 3 attempts"; df -h "$WORK" || true; exit 1; }
+        echo "Downloaded zip: $(du -h "$ZIP" | cut -f1)"
+
+        echo "=== Extracting ==="
+        # The artifact now holds the release tar.gz (not the raw bundle contents):
+        # unzip it, then untar so $DEST is the bundle root (bin/, lib/, ...).
+        # tar.gz preserves the ROCm symlinks the zip previously dropped.
+        if command -v unzip >/dev/null 2>&1; then
+          unzip -q -o "$ZIP" -d "$WORK/raw"
+        else
+          python3 -m zipfile -e "$ZIP" "$WORK/raw"
+        fi
+        rm -f "$ZIP"   # reclaim space immediately
+        TARBALL=$(find "$WORK/raw" -name '*.tar.gz' | head -n1)
+        [ -n "$TARBALL" ] || { echo "::error::no release archive in ${GFX} artifact"; exit 1; }
+        tar -xzf "$TARBALL" -C "$DEST"
+        rm -rf "$WORK/raw"
+        echo "Extracted $(du -sh "$DEST" | cut -f1) to $DEST"
+        echo "=== Disk after extract ==="; df -h "$WORK" || true
+
+    - name: Restore permissions and ROCm symlinks
+      shell: bash
+      run: |
+        # The artifact zip wraps a single tar.gz whose tar -xzf restores modes
+        # and the unversioned .so symlinks, so this is a defensive backstop
+        # (older raw-file artifacts lost +x), not a required repair.
+        ROOT="${{ runner.temp }}/vllm-qual/vllm"
+        # The bundle's Python version is channel-dependent (cp313 stable / cp314
+        # nightly); glob it rather than hardcode.
+        SP="$(echo "$ROOT"/lib/python3.*/site-packages)"
+        chmod +x "$ROOT/bin/"* 2>/dev/null || true
+        chmod +x "$SP/_rocm_sdk_core/lib/llvm/bin/"clang* 2>/dev/null || true
+        ROCM_LIB="$SP/_rocm_sdk_core/lib"
+        for lib in "$ROCM_LIB"/*.so.*; do
+          [ -e "$lib" ] || continue
+          name=$(basename "$lib"); link="$ROCM_LIB/${name%%.*}.so"
+          # Use `if` (not `&&`) so a pre-existing symlink doesn't leave the loop
+          # with exit 1 and trip `set -e`. The artifact preserves these symlinks,
+          # so this is now mostly a defensive no-op.
+          if [ ! -e "$link" ]; then ln -sf "$name" "$link"; fi
+        done
+
+    - name: Run 16-test qualification (tier0 + tier1 + tier2)
+      id: qual
+      shell: bash
+      run: |
+        WORK="${{ runner.temp }}/vllm-qual"
+        ROOT="$WORK/vllm"
+        PY="$ROOT/bin/python3"
+        FRAG="$WORK/fragments"; mkdir -p "$FRAG"
+        Q="$GITHUB_WORKSPACE/scripts/qualify"
+        TAG="vllm${{ inputs.vllm_version }}-${GFX}"
+        # Omni builds qualify the omni serving path and record an omni candidate tag.
+        if [ "$OMNI" = "true" ]; then
+          TAG="vllm-omni${{ inputs.omni_version }}-${GFX}"
+        fi
+
+        # The tiers are run WITHOUT --fail-on-error so all 16 tests execute and
+        # emit a JSON fragment even when one fails; `aggregate --fail-on-no-promote`
+        # is the single gate that decides pass/fail for the whole job.
+        echo "::group::Tier 0 — static bundle verification (T0.1–T0.6)"
+        "$PY" "$Q/tier0_static.py"   --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" --output "$FRAG/tier0-report.json" || true
+        echo "::endgroup::"
+
+        echo "::group::Tier 1 — hardware smoke (T1.1–T1.5)"
+        "$PY" "$Q/tier1_smoke.py"    --bundle-root "$ROOT" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" --output "$FRAG/tier1-report.json" || true
+        echo "::endgroup::"
+
+        # Tier 2 functional inference. Omni bundles run the omni serving path
+        # (vllm-omni-server + single-GPU deploy config) instead of plain vLLM;
+        # both emit a `tier2` fragment so the aggregate require-tiers rule is
+        # identical. The two are mutually exclusive per run.
+        if [ "$OMNI" = "true" ]; then
+          echo "::group::Tier 2 (omni) — functional inference via vllm-omni-server"
+          "$PY" "$Q/tier2_omni.py" --bundle-root "$ROOT" --gfx-target "$GFX" \
+              --channel "$CHANNEL" --candidate-tag "$TAG" --logs-dir "$FRAG" \
+              --output "$FRAG/tier2-report.json" || true
+          echo "::endgroup::"
+        else
+          echo "::group::Tier 2 — functional inference (T2.1–T2.5)"
+          "$PY" "$Q/tier2_inference.py" --bundle-root "$ROOT" --gfx-target "$GFX" \
+              --channel "$CHANNEL" --candidate-tag "$TAG" \
+              --model Qwen/Qwen2.5-0.5B-Instruct --logs-dir "$FRAG" \
+              --output "$FRAG/tier2-report.json" || true
+          echo "::endgroup::"
+        fi
+
+        echo "=== Aggregate fragments → qualification report (gates the job) ==="
+        "$PY" "$Q/aggregate.py" --fragments-dir "$FRAG" --gfx-target "$GFX" \
+            --channel "$CHANNEL" --candidate-tag "$TAG" \
+            --require-tiers tier0,tier1,tier2 --hardware-validated \
+            --output "$FRAG/qualification-report.json" \
+            --fail-on-no-promote
+
+    - name: Upload qualification report and fragments
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.report_artifact_name }}
+        path: |
+          ${{ runner.temp }}/vllm-qual/fragments/*.json
+          ${{ runner.temp }}/vllm-qual/fragments/*.log
+        if-no-files-found: warn
+
+    - name: Tear down and clean up
+      if: always()
+      shell: bash
+      run: |
+        # Free the GPU on this persistent runner no matter how the harness ended.
+        WORK="${{ runner.temp }}/vllm-qual"
+        pkill -9 -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+        rm -rf "$WORK" || true
