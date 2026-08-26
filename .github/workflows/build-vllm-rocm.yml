@@ -281,8 +281,14 @@ jobs:
         #     PIP_NO_CACHE_DIR=1, so ~/.cache/pip only ever shrinks from here)
         #   - stale build trees from prior/crashed runs (a run that dies on ENOSPC
         #     never reaches this job's end-of-job cleanup)
-        echo "=== Disk BEFORE cleanup ==="; df -h "$RUNNER_TEMP" || true
-        # ---- TEMPORARY debug: what is eating the disk? Remove once diagnosed. ----
+        # ---- TEMPORARY debug: what/where is filling up? Remove once diagnosed. --
+        # $RUNNER_TEMP lives on the big work partition, but pip's cache (~/.cache)
+        # and build temp ($TMPDIR/tmp) may sit on a SMALLER partition — that, not
+        # the 1.7T work disk, is the likely ENOSPC culprit. Show every mount that
+        # matters + which box we're on, so we can prove which filesystem fills.
+        echo "=== runner: ${RUNNER_NAME:-?}  TMPDIR=${TMPDIR:-/tmp} ==="
+        echo "=== Disk BEFORE cleanup (all relevant mounts) ==="
+        df -h / /tmp "$HOME" "$HOME/.cache" "$RUNNER_TEMP" 2>/dev/null || true
         echo "--- top consumers in HOME cache + RUNNER_TEMP ---"
         du -sh "$HOME/.cache/pip"          2>/dev/null || true
         du -sh "$HOME/.cache/huggingface"  2>/dev/null || true
@@ -291,7 +297,8 @@ jobs:
         # -------------------------------------------------------------------------
         rm -rf "$HOME/.cache/pip"         2>/dev/null || true
         rm -rf "$RUNNER_TEMP"/vllm-build* 2>/dev/null || true
-        echo "=== Disk AFTER cleanup ==="; df -h "$RUNNER_TEMP" || true
+        echo "=== Disk AFTER cleanup (all relevant mounts) ==="
+        df -h / /tmp "$HOME" "$HOME/.cache" "$RUNNER_TEMP" 2>/dev/null || true
 
     - name: Download portable Python (python-build-standalone)
       run: |
