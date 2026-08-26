@@ -1,7 +1,65 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-26T06:28:29Z",
+  "updated_at": "2026-08-26T07:13:33Z",
   "builds": [
+    {
+      "build_id": "32940620730-gfx1151-stable",
+      "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "stable",
+      "generated_at": "2026-08-26T07:13:33Z",
+      "run_id": "32940620730",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/32940620730",
+      "vllm_version": "0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513",
+      "torch_version": "2.9.1+rocm7.13.0",
+      "rocm_version": "7.13.0",
+      "tests": {
+        "passed": 7,
+        "failed": 4,
+        "warned": 0,
+        "skipped": 6,
+        "total": 17
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier0=fail",
+        "tier1=fail",
+        "tier2=fail"
+      ],
+      "summary": {
+        "title": "Torch ABI mismatch in native extensions (gfx1151)",
+        "recommended_action": "Rebuild vLLM native extensions (_C and _rocm_C) against torch 2.9.1+rocm7.13.0 to resolve ABI symbols. Also update transformers and tokenizers to compatible versions (tokenizers <=0.23.0) before requalification.",
+        "blocking_tests": [
+          "T0.2",
+          "T1.1",
+          "T1.5",
+          "T2.1"
+        ],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "skip",
+        "T0.2": "fail",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.5": "skip",
+        "T0.6": "pass",
+        "T0.7": "pass",
+        "T1.1": "fail",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "fail",
+        "T2.1": "fail",
+        "T2.2": "skip",
+        "T2.3": "skip",
+        "T2.4": "skip",
+        "T2.5": "skip"
+      },
+      "report_url": "reports/32940620730-gfx1151-stable.json"
+    },
     {
       "build_id": "32937485762-gfx1151-stable",
       "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
