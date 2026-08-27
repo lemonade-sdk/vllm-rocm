@@ -1,7 +1,64 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-26T07:13:33Z",
+  "updated_at": "2026-08-27T19:43:18Z",
   "builds": [
+    {
+      "build_id": "33108845304-gfx1151-stable",
+      "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
+      "gfx_target": "gfx1151",
+      "channel": "stable",
+      "generated_at": "2026-08-27T19:43:18Z",
+      "run_id": "33108845304",
+      "run_attempt": 1,
+      "run_url": "https://github.com/lemonade-sdk/vllm-rocm/actions/runs/33108845304",
+      "vllm_version": "0.19.1.dev3+rocm7.13.0.g72ed2b398.d20260513",
+      "torch_version": "2.9.1+rocm7.13.0",
+      "rocm_version": "7.13.0",
+      "tests": {
+        "passed": 8,
+        "failed": 3,
+        "warned": 0,
+        "skipped": 6,
+        "total": 17
+      },
+      "qualified": false,
+      "overall": "fail",
+      "blocked_by": [
+        "tier0=fail",
+        "tier1=fail",
+        "tier2=fail"
+      ],
+      "summary": {
+        "title": "Torch ABI mismatch: 7 unresolved c10 symbols",
+        "recommended_action": "Rebuild vLLM native extensions against torch 2.9.1+rocm7.13.0, or use a pre-built wheel compiled with the same torch version.",
+        "blocking_tests": [
+          "T0.2",
+          "T1.1",
+          "T2.1"
+        ],
+        "source": "llm"
+      },
+      "results": {
+        "T0.1": "skip",
+        "T0.2": "fail",
+        "T0.3": "pass",
+        "T0.4": "pass",
+        "T0.5": "skip",
+        "T0.6": "pass",
+        "T0.7": "pass",
+        "T1.1": "fail",
+        "T1.2": "pass",
+        "T1.3": "pass",
+        "T1.4": "pass",
+        "T1.5": "pass",
+        "T2.1": "fail",
+        "T2.2": "skip",
+        "T2.3": "skip",
+        "T2.4": "skip",
+        "T2.5": "skip"
+      },
+      "report_url": "reports/33108845304-gfx1151-stable.json"
+    },
     {
       "build_id": "32940620730-gfx1151-stable",
       "tag": "vllm0.19.1+rocm7.13.0rc2-gfx1151",
