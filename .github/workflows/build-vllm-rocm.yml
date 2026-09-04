@@ -192,19 +192,23 @@ jobs:
         echo "ubuntu_matrix=$matrix_targets" >> $GITHUB_OUTPUT
         echo "Generated matrix: $matrix_targets"
 
-        # Targets with qualification hardware, mapped to the self-hosted runner
-        # group that owns each. The qualify job runs one leg per selected target
-        # that appears here; targets absent from this registry build and release
-        # exactly as before (qualify skips them -> release ungated, unchanged).
-        # Adding a runner for a new target (e.g. a CDNA box for gfx942) is a
-        # one-line addition to this map.
-        QUALIFIED_RUNNERS='{"gfx1151":"dev_lab"}'
+        # Targets with qualification hardware, mapped to the runs-on labels that
+        # reach it. The qualify job runs one leg per selected target that appears
+        # here; targets absent from this registry build and release exactly as
+        # before (qualify skips them -> release ungated, unchanged). Adding a
+        # runner for a new target (e.g. a CDNA box for gfx942) is a one-line
+        # addition to this map.
+        #
+        # Was '{"gfx1151":"dev_lab"}', naming a runner group. It names labels
+        # now: gfx1151 is Strix Halo, and the DevLab ephemeral pool answers to
+        # `devlab-dispatch` + `strix-halo`. See vllm-rocm#42.
+        QUALIFIED_RUNNERS='{"gfx1151":["self-hosted","Linux","devlab-dispatch","strix-halo"]}'
         qualify_matrix=$(echo "$targets" \
           | tr ',' '\n' \
           | sed 's/^ *//;s/ *$//' \
           | jq -R . \
           | jq -s --argjson q "$QUALIFIED_RUNNERS" \
-              'unique | {include: [.[] | select($q[.] != null) | {gfx: ., runner_group: $q[.]}]}' \
+              'unique | {include: [.[] | select($q[.] != null) | {gfx: ., runner_labels: $q[.]}]}' \
           | jq -c)
         # JSON array (not a comma list): consumers use fromJson() set membership,
         # so no target string can substring-match another.
@@ -216,19 +220,28 @@ jobs:
         echo "Qualify matrix: $qualify_matrix"
 
   build-ubuntu:
-    # Target the dev_lab runner GROUP explicitly, not just labels. The org's
-    # Default group is visibility:all, so a bare [self-hosted, Linux] also
-    # matches Linux boxes in other groups (stx / sjlab / Default) the repo can
-    # see — runs landed on a non-dev_lab box. `group: dev_lab` + the Linux label
-    # selects only the dev_lab Linux box (currently ta-devlab-halo-03) with no
-    # name-pin, so it survives re-image/rename as long as the box stays in the
-    # group. AMD's frameworks-nightlies host allowlists these boxes' egress but
-    # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
-    # here. Build needs only network + pip (no GPU); it shares the box with
-    # qualify, which runs after via `needs`.
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    # Moved from the dev_lab runner GROUP to AMD DevLab's ephemeral pool.
+    #
+    # The group was here to solve a targeting problem: the org's Default group
+    # is visibility:all, so a bare [self-hosted, Linux] also matched Linux boxes
+    # in other groups (stx / sjlab / Default) and runs landed on a non-dev_lab
+    # box. `devlab-dispatch` solves the same problem by label instead -- only
+    # the ephemeral pool's hosts carry it, and it exists precisely so that
+    # reaching this pool is something a workflow opts into rather than something
+    # a generic [self-hosted, Linux] falls into. `strix-halo` then narrows to
+    # Halo silicon.
+    #
+    # WATCH THIS ONE: AMD's frameworks-nightlies host allowlists the dev_lab
+    # boxes' egress and 403s GitHub-hosted runner IPs, which is why the nightly
+    # vLLM wheel has to be fetched on a lab box at all. Whether the ephemeral
+    # pool's Halos are inside that allowlist is the open question this change
+    # answers -- if the wheel fetch 403s here, this job is the reason to revert.
+    # See lemonade-sdk/vllm-rocm#42.
+    #
+    # Build needs only network + pip (no GPU). It no longer shares a box with
+    # qualify -- each ephemeral leg gets its own host -- which is fine, since
+    # they already pass artifacts rather than filesystem state.
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream — qualify/create-release
     # cascade off a skipped build) when this build has already been qualified.
@@ -940,9 +953,11 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.qualify_matrix) }}
       fail-fast: false
-    runs-on:
-      group: ${{ matrix.runner_group }}
-      labels: [self-hosted, Linux]
+    # Moved to the ephemeral pool alongside build-ubuntu. `matrix.runner_labels`
+    # rather than a group, for the reasons in build-ubuntu above; the registry
+    # in prepare-matrix still decides *which* targets qualify, it just names
+    # labels now instead of a runner group.
+    runs-on: ${{ matrix.runner_labels }}
     env:
       GFX: ${{ matrix.gfx }}
     # Runs on release builds AND on omni dispatches (omni is experimental —
